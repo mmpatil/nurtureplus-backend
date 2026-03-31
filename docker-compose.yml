@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nurtureplus_postgres
+    environment:
+      POSTGRES_USER: nurture_user
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: nurtureplus_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nurture_user -d nurtureplus_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nurtureplus_network
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nurtureplus_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nurture_user:password123@postgres:5432/nurtureplus_db
+      GOOGLE_APPLICATION_CREDENTIALS: ./service-account.json
+      DEV_BYPASS_AUTH: "true"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:8000"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - /app/__pycache__
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
+    networks:
+      - nurtureplus_network
+
+volumes:
+  postgres_data:
+
+networks:
+  nurtureplus_network:
+    driver: bridge
