@@ -19,15 +19,24 @@ from app.crud import feeding_entries as feeding_crud
 from app.crud import diaper_entries as diaper_crud
 from app.crud import sleep_entries as sleep_crud
 from app.crud import mood_entries as mood_crud
+from app.crud import recovery_entries as recovery_crud
 from app.schemas.feeding import Feeding, FeedingCreate, FeedingUpdate, FeedingListResponse
 from app.schemas.diaper import Diaper, DiaperCreate, DiaperUpdate, DiaperListResponse
 from app.schemas.sleep import Sleep, SleepCreate, SleepUpdate, SleepListResponse
 from app.schemas.mood import Mood, MoodCreate, MoodUpdate, MoodListResponse
+from app.schemas.recovery import (
+    RecoveryEntryCreate,
+    RecoveryEntryResponse,
+    RecoveryEntryUpdate,
+    RecoveryEntryListResponse,
+    RecoverySummaryResponse,
+)
 from app.models.feeding_entry import FeedingEntry
 from app.models.diaper_entry import DiaperEntry
 from app.models.sleep_entry import SleepEntry
 from app.models.mood_entry import MoodEntry
 from app.models.babies import Baby as BabyModel
+from app.models.recovery_entry import RecoveryEntry
 
 logger = logging.getLogger(__name__)
 
@@ -706,6 +715,145 @@ async def delete_mood(
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mood not found")
     
+    return None
+
+
+# ============================================================================
+# Recovery Endpoints (User/Mother Postpartum Recovery Tracking)
+# ============================================================================
+
+
+@router.post("/recovery", tags=["recovery"], response_model=RecoveryEntryResponse, status_code=status.HTTP_201_CREATED)
+async def create_recovery_entry(
+    recovery_create: RecoveryEntryCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> RecoveryEntryResponse:
+    """Create a new recovery entry for the authenticated user."""
+    entry = await recovery_crud.create_recovery_entry(db, current_user.id, recovery_create)
+    return RecoveryEntryResponse.model_validate(entry)
+
+
+@router.get("/recovery", tags=["recovery"], response_model=RecoveryEntryListResponse)
+async def list_recovery_entries(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    from_time: Optional[str] = Query(None, description="Start time (ISO 8601)"),
+    to_time: Optional[str] = Query(None, description="End time (ISO 8601)"),
+) -> RecoveryEntryListResponse:
+    """List recovery entries for the authenticated user, newest first."""
+    from_dt = None
+    to_dt = None
+    try:
+        if from_time:
+            from_dt = date_parser.isoparse(from_time)
+        if to_time:
+            to_dt = date_parser.isoparse(to_time)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid date format")
+
+    entries, total = await recovery_crud.list_recovery_entries(
+        db, current_user.id, limit=limit, offset=offset, from_time=from_dt, to_time=to_dt
+    )
+
+    return RecoveryEntryListResponse(
+        items=[RecoveryEntryResponse.model_validate(entry) for entry in entries],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/recovery/latest", tags=["recovery"], response_model=Optional[RecoveryEntryResponse])
+async def get_latest_recovery_entry(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Optional[RecoveryEntryResponse]:
+    """Get the most recent recovery entry for the authenticated user."""
+    entry = await recovery_crud.get_latest_recovery_entry(db, current_user.id)
+    if entry:
+        return RecoveryEntryResponse.model_validate(entry)
+    return None
+
+
+@router.get("/recovery/summary", tags=["recovery"], response_model=RecoverySummaryResponse)
+async def get_recovery_summary(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    days: int = Query(7, ge=1, le=365, description="Number of days to summarize"),
+) -> RecoverySummaryResponse:
+    """Get recovery summary for the authenticated user over the specified number of days."""
+    summary_data = await recovery_crud.get_recovery_summary(db, current_user.id, days=days)
+    
+    response = RecoverySummaryResponse(
+        days=summary_data["days"],
+        average_water_intake_oz=summary_data["average_water_intake_oz"],
+        check_in_count=summary_data["check_in_count"],
+    )
+    
+    if summary_data["latest_entry"]:
+        response.latest_entry = RecoveryEntryResponse.model_validate(summary_data["latest_entry"])
+    
+    return response
+
+
+@router.get("/recovery/{entry_id}", tags=["recovery"], response_model=RecoveryEntryResponse)
+async def get_recovery_entry(
+    entry_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> RecoveryEntryResponse:
+    """Get a recovery entry by ID for the authenticated user."""
+    try:
+        entry_uuid = UUID(entry_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid entry ID")
+
+    entry = await recovery_crud.get_recovery_entry(db, entry_uuid, current_user.id)
+    if not entry:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recovery entry not found")
+
+    return RecoveryEntryResponse.model_validate(entry)
+
+
+@router.put("/recovery/{entry_id}", tags=["recovery"], response_model=RecoveryEntryResponse)
+async def update_recovery_entry(
+    entry_id: str,
+    recovery_update: RecoveryEntryUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> RecoveryEntryResponse:
+    """Update a recovery entry for the authenticated user."""
+    try:
+        entry_uuid = UUID(entry_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid entry ID")
+
+    entry = await recovery_crud.update_recovery_entry(db, entry_uuid, current_user.id, recovery_update)
+    if not entry:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recovery entry not found")
+
+    return RecoveryEntryResponse.model_validate(entry)
+
+
+@router.delete("/recovery/{entry_id}", tags=["recovery"], status_code=status.HTTP_204_NO_CONTENT)
+async def delete_recovery_entry(
+    entry_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a recovery entry for the authenticated user."""
+    try:
+        entry_uuid = UUID(entry_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid entry ID")
+
+    deleted = await recovery_crud.delete_recovery_entry(db, entry_uuid, current_user.id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recovery entry not found")
+
     return None
 
 
