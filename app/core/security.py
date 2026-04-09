@@ -17,17 +17,29 @@ logger = logging.getLogger(__name__)
 
 # Initialize Firebase Admin SDK
 def init_firebase():
-    """Initialize Firebase Admin SDK from service account JSON."""
-    creds_path = settings.google_application_credentials
-    if not os.path.exists(creds_path):
-        logger.warning(f"Service account JSON not found at {creds_path}")
+    """Initialize Firebase Admin SDK from env var JSON or file path."""
+    import json
+
+    if firebase_admin._apps:
         return
-    
+
     try:
-        if not firebase_admin._apps:
+        # Prefer JSON content in env var (for serverless / Vercel)
+        json_content = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+        if json_content:
+            creds = credentials.Certificate(json.loads(json_content))
+            firebase_admin.initialize_app(creds)
+            logger.info("Firebase Admin SDK initialized from env var")
+            return
+
+        # Fall back to file path
+        creds_path = settings.google_application_credentials
+        if os.path.exists(creds_path):
             creds = credentials.Certificate(creds_path)
             firebase_admin.initialize_app(creds)
-            logger.info("Firebase Admin SDK initialized successfully")
+            logger.info("Firebase Admin SDK initialized from file")
+        else:
+            logger.warning(f"No Firebase credentials found (checked env var and {creds_path})")
     except Exception as e:
         logger.error(f"Failed to initialize Firebase: {e}")
 
@@ -54,7 +66,7 @@ async def verify_firebase_token(token: str) -> dict:
         firebase_uid = decoded_token.get("uid")
         logger.info(f"Firebase token verified for user: {firebase_uid}")
         return decoded_token
-    except auth.ExpiredSignInError as e:
+    except auth.ExpiredIdTokenError as e:
         logger.warning(f"Expired Firebase token: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

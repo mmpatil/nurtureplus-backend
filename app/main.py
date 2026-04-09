@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings, logger
+from app.core.security import init_firebase
 from app.api.routes import router as api_router
 from app.db.base import Base
 from app.db.session import engine
@@ -20,6 +21,7 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events.
     """
     # Startup
+    init_firebase()
     _logger.info("Starting Nurture+ API")
     _logger.info(f"Log level: {settings.log_level}")
     _logger.info(f"Dev bypass auth: {settings.dev_bypass_auth}")

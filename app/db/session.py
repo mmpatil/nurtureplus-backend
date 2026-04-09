@@ -9,10 +9,11 @@ logger = logging.getLogger(__name__)
 engine = create_async_engine(
     settings.database_url,
     echo=False,  # Set to True for SQL debugging
-    pool_size=20,  # Connection pool size
-    max_overflow=10,  # Max overflow connections
+    pool_size=5,  # Neon free tier has limited connections
+    max_overflow=2,
     pool_pre_ping=True,  # Test connections before using from pool
-    pool_recycle=3600,  # Recycle connections after 1 hour
+    pool_recycle=300,  # Neon suspends idle connections after ~5 min
+    connect_args={"ssl": "require"},
 )
 
 # Create async session factory
