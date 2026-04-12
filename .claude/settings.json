@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(alembic upgrade head)",
+      "Bash(alembic current)",
+      "Bash(alembic history)",
+      "Bash(alembic downgrade -1)",
+      "Bash(alembic revision --autogenerate*)",
+      "Bash(pytest*)",
+      "Bash(uvicorn app.main:app*)",
+      "Bash(python3 -c \"import app.main\")",
+      "Bash(docker-compose up*)",
+      "Bash(docker-compose down*)",
+      "Bash(docker-compose logs*)",
+      "Bash(pip install -r requirements.txt)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(git diff*)",
+      "Bash(git status)",
+      "Bash(git log*)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(docker-compose down -v*)"
+    ]
+  }
+}

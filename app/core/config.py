@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     app_title: str = "Nurture+ API"
     app_version: str = "1.0.0"
     
+    # Firebase credentials as JSON string (used on Vercel/serverless)
+    firebase_service_account_json: Optional[str] = None
+
     class Config:
         env_file = ".env"
         case_sensitive = False

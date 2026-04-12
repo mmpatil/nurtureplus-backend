@@ -20,6 +20,8 @@ from app.crud import diaper_entries as diaper_crud
 from app.crud import sleep_entries as sleep_crud
 from app.crud import mood_entries as mood_crud
 from app.crud import recovery_entries as recovery_crud
+from app.crud import growth_entries as growth_crud
+from app.crud import milestone_entries as milestone_crud
 from app.schemas.feeding import Feeding, FeedingCreate, FeedingUpdate, FeedingListResponse
 from app.schemas.diaper import Diaper, DiaperCreate, DiaperUpdate, DiaperListResponse
 from app.schemas.sleep import Sleep, SleepCreate, SleepUpdate, SleepListResponse
@@ -37,6 +39,8 @@ from app.models.sleep_entry import SleepEntry
 from app.models.mood_entry import MoodEntry
 from app.models.babies import Baby as BabyModel
 from app.models.recovery_entry import RecoveryEntry
+from app.schemas.growth import Growth, GrowthCreate, GrowthUpdate, GrowthListResponse
+from app.schemas.milestone import Milestone, MilestoneCreate, MilestoneUpdate, MilestoneListResponse
 
 logger = logging.getLogger(__name__)
 
@@ -964,3 +968,125 @@ async def get_analytics_summary(
             "avgSleepHoursPerDay": avg_sleep_hours,
         }
     }
+
+
+# ============================================================================
+# Growth Endpoints
+# ============================================================================
+
+
+@router.get("/babies/{baby_id}/growth", tags=["growth"], response_model=GrowthListResponse)
+async def list_growth_entries(
+    baby_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> GrowthListResponse:
+    entries, total = await growth_crud.get_growth_entries_for_baby(
+        db, baby_id, current_user.id, limit=limit, offset=offset
+    )
+    return GrowthListResponse(
+        items=[Growth.model_validate(e) for e in entries],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/babies/{baby_id}/growth", tags=["growth"], response_model=Growth, status_code=status.HTTP_201_CREATED)
+async def create_growth_entry(
+    baby_id: UUID,
+    body: GrowthCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Growth:
+    entry = await growth_crud.create_growth_entry(db, baby_id, current_user.id, body)
+    if entry is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Baby not found")
+    return Growth.model_validate(entry)
+
+
+@router.put("/growth/{growth_id}", tags=["growth"], response_model=Growth)
+async def update_growth_entry(
+    growth_id: UUID,
+    body: GrowthUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Growth:
+    entry = await growth_crud.update_growth_entry(db, growth_id, current_user.id, body)
+    if entry is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Growth entry not found")
+    return Growth.model_validate(entry)
+
+
+@router.delete("/growth/{growth_id}", tags=["growth"], status_code=status.HTTP_204_NO_CONTENT)
+async def delete_growth_entry(
+    growth_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    deleted = await growth_crud.delete_growth_entry(db, growth_id, current_user.id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Growth entry not found")
+
+
+# ============================================================================
+# Milestones Endpoints
+# ============================================================================
+
+
+@router.get("/babies/{baby_id}/milestones", tags=["milestones"], response_model=MilestoneListResponse)
+async def list_milestone_entries(
+    baby_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> MilestoneListResponse:
+    entries, total = await milestone_crud.get_milestone_entries_for_baby(
+        db, baby_id, current_user.id, limit=limit, offset=offset
+    )
+    return MilestoneListResponse(
+        items=[Milestone.model_validate(e) for e in entries],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/babies/{baby_id}/milestones", tags=["milestones"], response_model=Milestone, status_code=status.HTTP_201_CREATED)
+async def create_milestone_entry(
+    baby_id: UUID,
+    body: MilestoneCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Milestone:
+    entry = await milestone_crud.create_milestone_entry(db, baby_id, current_user.id, body)
+    if entry is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Baby not found")
+    return Milestone.model_validate(entry)
+
+
+@router.put("/milestones/{milestone_id}", tags=["milestones"], response_model=Milestone)
+async def update_milestone_entry(
+    milestone_id: UUID,
+    body: MilestoneUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Milestone:
+    entry = await milestone_crud.update_milestone_entry(db, milestone_id, current_user.id, body)
+    if entry is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Milestone entry not found")
+    return Milestone.model_validate(entry)
+
+
+@router.delete("/milestones/{milestone_id}", tags=["milestones"], status_code=status.HTTP_204_NO_CONTENT)
+async def delete_milestone_entry(
+    milestone_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    deleted = await milestone_crud.delete_milestone_entry(db, milestone_id, current_user.id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Milestone entry not found")
