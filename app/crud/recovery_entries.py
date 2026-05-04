@@ -22,6 +22,8 @@ async def create_recovery_entry(
     """Create a new recovery entry for the user."""
     db_entry = RecoveryEntry(
         user_id=user_id,
+        created_by_user_id=user_id,
+        updated_by_user_id=user_id,
         timestamp=entry.timestamp,
         mood=entry.mood,
         energy_level=entry.energy_level,
@@ -130,6 +132,7 @@ async def update_recovery_entry(
         setattr(db_entry, field, value)
 
     db_entry.updated_at = datetime.now(timezone.utc)
+    db_entry.updated_by_user_id = user_id
 
     db.add(db_entry)
     await db.commit()

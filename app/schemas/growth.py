@@ -1,16 +1,19 @@
+from __future__ import annotations
 """Pydantic schemas for growth entries."""
 from datetime import date, datetime
 from uuid import UUID
+from typing import Optional
 from pydantic import BaseModel, Field, model_validator
+from app.schemas.user import UserSummary
 
 
 class GrowthBase(BaseModel):
     """Base growth schema."""
     measurement_date: date = Field(..., description="Date of measurement")
-    weight_kg: float | None = Field(None, gt=0, le=30, description="Weight in kilograms")
-    height_cm: float | None = Field(None, gt=0, le=150, description="Height in centimeters")
-    head_circumference_cm: float | None = Field(None, gt=0, le=80, description="Head circumference in centimeters")
-    notes: str | None = Field(None, max_length=500, description="Optional notes")
+    weight_kg: Optional[float] = Field(None, gt=0, le=30, description="Weight in kilograms")
+    height_cm: Optional[float] = Field(None, gt=0, le=150, description="Height in centimeters")
+    head_circumference_cm: Optional[float] = Field(None, gt=0, le=80, description="Head circumference in centimeters")
+    notes: Optional[str] = Field(None, max_length=500, description="Optional notes")
 
     @model_validator(mode="after")
     def at_least_one_measurement(self) -> "GrowthBase":
@@ -26,17 +29,21 @@ class GrowthCreate(GrowthBase):
 
 class GrowthUpdate(BaseModel):
     """Schema for updating a growth entry."""
-    measurement_date: date | None = None
-    weight_kg: float | None = Field(None, gt=0, le=30)
-    height_cm: float | None = Field(None, gt=0, le=150)
-    head_circumference_cm: float | None = Field(None, gt=0, le=80)
-    notes: str | None = Field(None, max_length=500)
+    measurement_date: Optional[date] = None
+    weight_kg: Optional[float] = Field(None, gt=0, le=30)
+    height_cm: Optional[float] = Field(None, gt=0, le=150)
+    head_circumference_cm: Optional[float] = Field(None, gt=0, le=80)
+    notes: Optional[str] = Field(None, max_length=500)
 
 
 class Growth(GrowthBase):
     """Growth schema for responses."""
     id: UUID
     baby_id: UUID
+    created_by_user_id: Optional[UUID] = None
+    updated_by_user_id: Optional[UUID] = None
+    created_by: Optional[UserSummary] = None
+    updated_by: Optional[UserSummary] = None
     created_at: datetime
     updated_at: datetime
 

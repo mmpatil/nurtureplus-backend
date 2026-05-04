@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Feeding entry database model."""
 import uuid
 from datetime import datetime, timezone
@@ -32,6 +33,17 @@ class FeedingEntry(Base):
         index=True,
     )
     notes: str = Column(Text, nullable=True)
+    # Audit: which caregiver/owner logged or last edited this entry
+    created_by_user_id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    updated_by_user_id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: datetime = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

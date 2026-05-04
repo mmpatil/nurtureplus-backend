@@ -1,3 +1,4 @@
+from __future__ import annotations
 """CRUD operations for users."""
 import logging
 from sqlalchemy import select

@@ -5,6 +5,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
+from app.schemas.user import UserSummary
 
 
 # Enum constraints
@@ -102,6 +103,10 @@ class RecoveryEntryResponse(RecoveryEntryBase):
 
     id: UUID
     user_id: UUID
+    created_by_user_id: Optional[UUID] = None
+    updated_by_user_id: Optional[UUID] = None
+    created_by: Optional[UserSummary] = None
+    updated_by: Optional[UserSummary] = None
     created_at: datetime
     updated_at: datetime
 

@@ -1,21 +1,18 @@
-"""CRUD operations for growth entries."""
+from __future__ import annotations
+"""CRUD operations for growth entries — membership-aware."""
 import logging
 from datetime import datetime, timezone
 from uuid import UUID
+
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models.growth_entry import GrowthEntry
+from app.models.baby_access import BabyAccess
+from app.crud._baby_access_check import verify_baby_access
 from app.schemas.growth import GrowthCreate, GrowthUpdate
 
 logger = logging.getLogger(__name__)
-
-
-async def _verify_baby_ownership(db: AsyncSession, baby_id: UUID, user_id: UUID) -> bool:
-    from app.models.babies import Baby
-    result = await db.execute(
-        select(Baby).where((Baby.id == baby_id) & (Baby.user_id == user_id))
-    )
-    return result.scalar_one_or_none() is not None
 
 
 async def get_growth_entries_for_baby(
@@ -25,7 +22,7 @@ async def get_growth_entries_for_baby(
     limit: int = 100,
     offset: int = 0,
 ) -> tuple[list[GrowthEntry], int]:
-    if not await _verify_baby_ownership(db, baby_id, user_id):
+    if not await verify_baby_access(db, baby_id, user_id):
         return [], 0
 
     count_result = await db.execute(
@@ -48,10 +45,13 @@ async def get_growth_entry_by_id(
     growth_id: UUID,
     user_id: UUID,
 ) -> GrowthEntry | None:
-    from app.models.babies import Baby
     result = await db.execute(
-        select(GrowthEntry).join(Baby).where(
-            (GrowthEntry.id == growth_id) & (Baby.user_id == user_id)
+        select(GrowthEntry)
+        .join(BabyAccess, BabyAccess.baby_id == GrowthEntry.baby_id)
+        .where(
+            GrowthEntry.id == growth_id,
+            BabyAccess.user_id == user_id,
+            BabyAccess.status == "accepted",
         )
     )
     return result.scalar_one_or_none()
@@ -63,7 +63,7 @@ async def create_growth_entry(
     user_id: UUID,
     growth_create: GrowthCreate,
 ) -> GrowthEntry | None:
-    if not await _verify_baby_ownership(db, baby_id, user_id):
+    if not await verify_baby_access(db, baby_id, user_id):
         return None
 
     entry = GrowthEntry(
@@ -73,6 +73,8 @@ async def create_growth_entry(
         height_cm=growth_create.height_cm,
         head_circumference_cm=growth_create.head_circumference_cm,
         notes=growth_create.notes,
+        created_by_user_id=user_id,
+        updated_by_user_id=user_id,
     )
     db.add(entry)
     await db.commit()
@@ -85,15 +87,20 @@ async def update_growth_entry(
     growth_id: UUID,
     user_id: UUID,
     growth_update: GrowthUpdate,
+    is_owner: bool = False,
 ) -> GrowthEntry | None:
     entry = await get_growth_entry_by_id(db, growth_id, user_id)
     if not entry:
+        return None
+
+    if not is_owner and entry.created_by_user_id != user_id:
         return None
 
     for key, value in growth_update.model_dump(exclude_unset=True).items():
         setattr(entry, key, value)
 
     entry.updated_at = datetime.now(timezone.utc)
+    entry.updated_by_user_id = user_id
     await db.commit()
     await db.refresh(entry)
     return entry
@@ -103,10 +110,15 @@ async def delete_growth_entry(
     db: AsyncSession,
     growth_id: UUID,
     user_id: UUID,
+    is_owner: bool = False,
 ) -> bool:
     entry = await get_growth_entry_by_id(db, growth_id, user_id)
     if not entry:
         return False
+
+    if not is_owner and entry.created_by_user_id != user_id:
+        return False
+
     await db.execute(delete(GrowthEntry).where(GrowthEntry.id == growth_id))
     await db.commit()
     return True

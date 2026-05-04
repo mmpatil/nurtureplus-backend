@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Growth entry database model."""
 import uuid
 from datetime import datetime, timezone
@@ -28,6 +29,16 @@ class GrowthEntry(Base):
     height_cm: float = Column(Float, nullable=True)
     head_circumference_cm: float = Column(Float, nullable=True)
     notes: str = Column(Text, nullable=True)
+    created_by_user_id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    updated_by_user_id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: datetime = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
