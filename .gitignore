@@ -208,3 +208,5 @@ __marimo__/
 .env.example
 service-account.json
 .env
+.codex/agents/*
+.agents/*
