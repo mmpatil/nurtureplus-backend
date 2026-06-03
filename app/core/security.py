@@ -2,9 +2,11 @@ from __future__ import annotations
 """Firebase authentication and security utilities."""
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Optional
 from fastapi import Depends, HTTPException, status, Header
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 import firebase_admin
 from firebase_admin import credentials, auth
 
@@ -47,7 +49,7 @@ def init_firebase():
 init_firebase()
 
 
-async def verify_firebase_token(token: str) -> dict:
+async def verify_firebase_token(token: str, *, check_revoked: bool = True) -> dict:
     """
     Verify Firebase ID token and return decoded claims.
 
@@ -55,9 +57,27 @@ async def verify_firebase_token(token: str) -> dict:
     sign_in_provider (used to detect anonymous accounts).
     """
     try:
-        decoded_token = auth.verify_id_token(token)
+        decoded_token = auth.verify_id_token(token, check_revoked=check_revoked)
         logger.info(f"Firebase token verified for user: {decoded_token.get('uid')}")
         return decoded_token
+    except auth.RevokedIdTokenError as e:
+        logger.warning(f"Revoked Firebase token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session revoked. Please sign in again.",
+        )
+    except auth.UserDisabledError as e:
+        logger.warning(f"Disabled Firebase user token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account disabled",
+        )
+    except auth.UserNotFoundError as e:
+        logger.warning(f"Deleted Firebase user token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account no longer exists",
+        )
     except auth.ExpiredIdTokenError as e:
         logger.warning(f"Expired Firebase token: {e}")
         raise HTTPException(
@@ -76,6 +96,72 @@ async def verify_firebase_token(token: str) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token verification failed",
         )
+
+
+def parse_bearer_token(authorization: Optional[str]) -> str:
+    """Extract Bearer token from Authorization header or raise 401."""
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authorization",
+        )
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format",
+        )
+    return parts[1]
+
+
+async def get_authenticated_identity(
+    authorization: Optional[str],
+    x_dev_uid: Optional[str],
+) -> dict:
+    """
+    Return normalized auth identity from dev bypass header or Firebase token.
+
+    Shape:
+      {
+        "firebase_uid": str,
+        "email": Optional[str],
+        "display_name": Optional[str],
+        "is_anonymous": bool,
+        "auth_time": Optional[datetime],
+      }
+    """
+    if settings.dev_bypass_auth and x_dev_uid:
+        logger.info(f"Using dev bypass auth with user: {x_dev_uid}")
+        return {
+            "firebase_uid": x_dev_uid,
+            "email": None,
+            "display_name": None,
+            "is_anonymous": False,
+            "auth_time": datetime.now(timezone.utc),
+        }
+
+    token = parse_bearer_token(authorization)
+    decoded = await verify_firebase_token(token, check_revoked=True)
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token claims",
+        )
+
+    auth_time = decoded.get("auth_time")
+    auth_datetime = (
+        datetime.fromtimestamp(auth_time, tz=timezone.utc)
+        if isinstance(auth_time, (int, float))
+        else None
+    )
+    return {
+        "firebase_uid": firebase_uid,
+        "email": decoded.get("email"),
+        "display_name": decoded.get("name"),
+        "is_anonymous": _is_anonymous_from_claims(decoded),
+        "auth_time": auth_datetime,
+    }
 
 
 def _is_anonymous_from_claims(decoded: dict) -> bool:
@@ -104,39 +190,11 @@ async def get_current_user(
     """
     from sqlalchemy import select
 
-    firebase_uid: Optional[str] = None
-    email: Optional[str] = None
-    display_name: Optional[str] = None
-    is_anonymous: bool = False
-
-    if settings.dev_bypass_auth and x_dev_uid:
-        logger.info(f"Using dev bypass auth with user: {x_dev_uid}")
-        firebase_uid = x_dev_uid
-        # Dev users are treated as non-anonymous permanent accounts
-    elif authorization:
-        parts = authorization.split()
-        if len(parts) != 2 or parts[0].lower() != "bearer":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authorization header format",
-            )
-
-        decoded = await verify_firebase_token(parts[1])
-        firebase_uid = decoded.get("uid")
-        email = decoded.get("email")
-        display_name = decoded.get("name")
-        is_anonymous = _is_anonymous_from_claims(decoded)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authorization",
-        )
-
-    if not firebase_uid:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token claims",
-        )
+    identity = await get_authenticated_identity(authorization, x_dev_uid)
+    firebase_uid = identity["firebase_uid"]
+    email = identity["email"]
+    display_name = identity["display_name"]
+    is_anonymous = identity["is_anonymous"]
 
     result = await db.execute(
         select(User).where(User.firebase_uid == firebase_uid)
@@ -157,6 +215,22 @@ async def get_current_user(
             logger.info(
                 f"User created - firebase_uid={firebase_uid}, internal_id={user.id}, "
                 f"anonymous={is_anonymous}"
+            )
+        except IntegrityError:
+            # Another request may have created the same user concurrently.
+            await db.rollback()
+            result = await db.execute(
+                select(User).where(User.firebase_uid == firebase_uid)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to create user session",
+                )
+            logger.info(
+                f"User session recovered after concurrent create - "
+                f"firebase_uid={firebase_uid}, internal_id={user.id}"
             )
         except Exception as e:
             await db.rollback()

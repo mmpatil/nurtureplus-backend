@@ -5,11 +5,13 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from dateutil import parser as date_parser
 
-from app.core.security import get_current_user
+from app.core.config import settings
+from app.core.security import get_current_user, get_authenticated_identity
 from app.core.access import (
     get_baby_access_for_user,
     check_baby_access,
@@ -21,6 +23,7 @@ from app.db.session import get_db
 from app.models.users import User
 from app.models.baby_access import BabyAccess
 from app.schemas.auth import SessionResponse
+from app.schemas.account import AccountDeletionResponse
 from app.schemas.baby import Baby, BabyCreate, BabyUpdate, BabyListResponse
 from app.schemas.user import UserSummary
 from app.schemas.caregiver import (
@@ -41,6 +44,7 @@ from app.crud import recovery_entries as recovery_crud
 from app.crud import growth_entries as growth_crud
 from app.crud import milestone_entries as milestone_crud
 from app.crud import baby_access as baby_access_crud
+from app.crud import account_deletion as account_deletion_crud
 from app.schemas.feeding import Feeding, FeedingCreate, FeedingUpdate, FeedingListResponse
 from app.schemas.diaper import Diaper, DiaperCreate, DiaperUpdate, DiaperListResponse
 from app.schemas.sleep import Sleep, SleepCreate, SleepUpdate, SleepListResponse
@@ -219,6 +223,118 @@ async def create_session(
         user_id=str(current_user.id),
         firebase_uid=current_user.firebase_uid,
     )
+
+
+@router.delete("/account", tags=["auth"], response_model=AccountDeletionResponse)
+async def delete_account(
+    authorization: Optional[str] = Header(None),
+    x_dev_uid: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> AccountDeletionResponse | JSONResponse:
+    """
+    Delete current user's account and associated data.
+
+    Notes:
+    - User identity is derived from verified auth token/header only.
+    - Idempotent: deleting an already-removed local account still succeeds.
+    - Returns structured success/failure payload for mobile clients.
+    """
+    try:
+        identity = await get_authenticated_identity(authorization, x_dev_uid)
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "success": False,
+                "code": "UNAUTHENTICATED",
+                "message": str(exc.detail),
+            },
+        )
+
+    auth_time: datetime | None = identity.get("auth_time")
+    if not settings.dev_bypass_auth and auth_time is not None:
+        max_age = timedelta(minutes=settings.account_delete_reauth_minutes)
+        if datetime.now(timezone.utc) - auth_time > max_age:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={
+                    "success": False,
+                    "code": "REAUTH_REQUIRED",
+                    "message": "Please sign in again before deleting your account.",
+                },
+            )
+
+    result = await db.execute(
+        select(User).where(User.firebase_uid == identity["firebase_uid"])
+    )
+    current_user = result.scalar_one_or_none()
+
+    # Idempotent local deletion response (user row may already be gone).
+    if current_user is None:
+        try:
+            account_deletion_crud.revoke_and_delete_auth_user(identity["firebase_uid"])
+        except account_deletion_crud.AccountDeletionError as exc:
+            logger.error(
+                "Account delete partial failure (local already gone): uid=%s code=%s",
+                identity["firebase_uid"],
+                exc.code,
+            )
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={
+                    "success": False,
+                    "code": exc.code,
+                    "message": exc.message,
+                },
+            )
+        return AccountDeletionResponse(
+            success=True,
+            message="Your account and associated data have been deleted.",
+        )
+
+    try:
+        local_result = await account_deletion_crud.delete_local_account_data(db, current_user)
+        account_deletion_crud.revoke_and_delete_auth_user(current_user.firebase_uid)
+        logger.info(
+            "Account deleted for user_id=%s firebase_uid=%s owned_babies=%d storage_objects_deleted=%d",
+            current_user.id,
+            current_user.firebase_uid,
+            len(local_result.owned_baby_ids),
+            local_result.storage_objects_deleted,
+        )
+        return AccountDeletionResponse(
+            success=True,
+            message="Your account and associated data have been deleted.",
+        )
+    except account_deletion_crud.AccountDeletionError as exc:
+        logger.error(
+            "Account deletion failed for user_id=%s firebase_uid=%s code=%s",
+            current_user.id,
+            current_user.firebase_uid,
+            exc.code,
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "success": False,
+                "code": exc.code,
+                "message": exc.message,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected account deletion failure for user_id=%s", current_user.id)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "code": "DELETION_FAILED",
+                "message": "Account deletion failed. Please try again.",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

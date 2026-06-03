@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     
     # Security
     dev_bypass_auth: bool = False
+    account_delete_reauth_minutes: int = 15
     
     # CORS
     allowed_origins: str = "http://localhost:3000,http://localhost:8000"
