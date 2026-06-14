@@ -62,6 +62,7 @@ async def create_milestone_entry(
     baby_id: UUID,
     user_id: UUID,
     milestone_create: MilestoneCreate,
+    autocommit: bool = True,
 ) -> MilestoneEntry | None:
     if not await verify_baby_access(db, baby_id, user_id):
         return None
@@ -77,8 +78,11 @@ async def create_milestone_entry(
         updated_by_user_id=user_id,
     )
     db.add(entry)
-    await db.commit()
-    await db.refresh(entry)
+    if autocommit:
+        await db.commit()
+        await db.refresh(entry)
+    else:
+        await db.flush()
     return entry
 
 

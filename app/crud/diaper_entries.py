@@ -70,6 +70,7 @@ async def create_diaper_entry(
     baby_id: UUID,
     user_id: UUID,
     diaper_create: DiaperCreate,
+    autocommit: bool = True,
 ) -> DiaperEntry | None:
     if not await verify_baby_access(db, baby_id, user_id):
         return None
@@ -83,8 +84,11 @@ async def create_diaper_entry(
         updated_by_user_id=user_id,
     )
     db.add(diaper)
-    await db.commit()
-    await db.refresh(diaper)
+    if autocommit:
+        await db.commit()
+        await db.refresh(diaper)
+    else:
+        await db.flush()
     return diaper
 
 

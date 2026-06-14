@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     
     # Logging
     log_level: str = "INFO"
+
+    # Voice logging
+    openai_api_key: Optional[str] = None
+    voice_llm_model: str = "gpt-4o-mini"
+    voice_autosave_threshold: float = 0.85
     
     # App
     app_title: str = "Nurture+ API"

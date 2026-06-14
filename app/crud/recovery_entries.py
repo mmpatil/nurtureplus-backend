@@ -18,6 +18,7 @@ async def create_recovery_entry(
     db: AsyncSession,
     user_id: UUID,
     entry: RecoveryEntryCreate,
+    autocommit: bool = True,
 ) -> RecoveryEntry:
     """Create a new recovery entry for the user."""
     db_entry = RecoveryEntry(
@@ -32,8 +33,11 @@ async def create_recovery_entry(
         notes=entry.notes,
     )
     db.add(db_entry)
-    await db.commit()
-    await db.refresh(db_entry)
+    if autocommit:
+        await db.commit()
+        await db.refresh(db_entry)
+    else:
+        await db.flush()
     logger.info(f"Created recovery entry: id={db_entry.id}, user_id={user_id}, mood={entry.mood}")
     return db_entry
 

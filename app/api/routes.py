@@ -45,6 +45,7 @@ from app.crud import growth_entries as growth_crud
 from app.crud import milestone_entries as milestone_crud
 from app.crud import baby_access as baby_access_crud
 from app.crud import account_deletion as account_deletion_crud
+from app.crud import voice_logging as voice_logging_crud
 from app.schemas.feeding import Feeding, FeedingCreate, FeedingUpdate, FeedingListResponse
 from app.schemas.diaper import Diaper, DiaperCreate, DiaperUpdate, DiaperListResponse
 from app.schemas.sleep import Sleep, SleepCreate, SleepUpdate, SleepListResponse
@@ -63,6 +64,7 @@ from app.models.babies import Baby as BabyModel
 from app.models.recovery_entry import RecoveryEntry
 from app.schemas.growth import Growth, GrowthCreate, GrowthUpdate, GrowthListResponse
 from app.schemas.milestone import Milestone, MilestoneCreate, MilestoneUpdate, MilestoneListResponse
+from app.schemas.voice import VoiceLogCreatedAction, VoiceLogDraftAction, VoiceLogRequest, VoiceLogResponse, VoiceLogType
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +176,17 @@ async def _serialize_entries_with_audit(
     ]
 
 
+VOICE_RESPONSE_SCHEMAS = {
+    VoiceLogType.feeding: Feeding,
+    VoiceLogType.diaper: Diaper,
+    VoiceLogType.sleep: Sleep,
+    VoiceLogType.mood: Mood,
+    VoiceLogType.recovery: RecoveryEntryResponse,
+    VoiceLogType.growth: Growth,
+    VoiceLogType.milestone: Milestone,
+}
+
+
 async def _resolve_caregiver_entry(
     db: AsyncSession,
     row: BabyAccess,
@@ -222,6 +235,64 @@ async def create_session(
     return SessionResponse(
         user_id=str(current_user.id),
         firebase_uid=current_user.firebase_uid,
+    )
+
+
+@router.post("/voice/logs", tags=["voice"], response_model=VoiceLogResponse)
+async def create_voice_logs(
+    body: VoiceLogRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> VoiceLogResponse:
+    analysis = await voice_logging_crud.analyze_voice_transcript(
+        transcript=body.transcript,
+        baby_id=body.baby_id,
+        timezone_name=body.timezone,
+        client_now=body.client_now,
+    )
+
+    if analysis.requires_baby_access and body.baby_id is not None:
+        await require_baby_edit_permission(db, body.baby_id, current_user)
+
+    if not analysis.should_autosave:
+        return VoiceLogResponse(
+            status=analysis.status,
+            message=analysis.message,
+            draft_actions=[
+                VoiceLogDraftAction(
+                    log_type=action.log_type,
+                    confidence=action.confidence,
+                    payload=action.payload,
+                    missing_fields=action.missing_fields,
+                    warnings=action.warnings,
+                )
+                for action in analysis.actions
+            ],
+        )
+
+    created = await voice_logging_crud.create_voice_logs(
+        db=db,
+        user_id=current_user.id,
+        baby_id=body.baby_id,
+        actions=analysis.actions,
+    )
+    return VoiceLogResponse(
+        status="created",
+        message=analysis.message,
+        created_actions=[
+            VoiceLogCreatedAction(
+                log_type=created_action.log_type,
+                confidence=created_action.confidence,
+                resource=(
+                    await _serialize_entry_with_audit(
+                        db,
+                        created_action.resource,
+                        VOICE_RESPONSE_SCHEMAS[created_action.log_type],
+                    )
+                ).model_dump(mode="json"),
+            )
+            for created_action in created
+        ],
     )
 
 

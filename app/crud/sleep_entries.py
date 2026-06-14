@@ -77,6 +77,7 @@ async def create_sleep_entry(
     baby_id: UUID,
     user_id: UUID,
     sleep_create: SleepCreate,
+    autocommit: bool = True,
 ) -> SleepEntry | None:
     if not await verify_baby_access(db, baby_id, user_id):
         return None
@@ -96,8 +97,11 @@ async def create_sleep_entry(
         updated_by_user_id=user_id,
     )
     db.add(sleep)
-    await db.commit()
-    await db.refresh(sleep)
+    if autocommit:
+        await db.commit()
+        await db.refresh(sleep)
+    else:
+        await db.flush()
     return sleep
 
 
