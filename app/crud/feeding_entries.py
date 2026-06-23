@@ -73,6 +73,7 @@ async def create_feeding_entry(
     baby_id: UUID,
     user_id: UUID,
     feeding_create: FeedingCreate,
+    autocommit: bool = True,
 ) -> FeedingEntry | None:
     """Create a feeding entry; requires accepted membership."""
     if not await verify_baby_access(db, baby_id, user_id):
@@ -89,8 +90,11 @@ async def create_feeding_entry(
         updated_by_user_id=user_id,
     )
     db.add(feeding)
-    await db.commit()
-    await db.refresh(feeding)
+    if autocommit:
+        await db.commit()
+        await db.refresh(feeding)
+    else:
+        await db.flush()
     return feeding
 
 

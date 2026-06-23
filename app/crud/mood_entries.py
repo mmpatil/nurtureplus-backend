@@ -70,6 +70,7 @@ async def create_mood_entry(
     baby_id: UUID,
     user_id: UUID,
     mood_create: MoodCreate,
+    autocommit: bool = True,
 ) -> MoodEntry | None:
     if not await verify_baby_access(db, baby_id, user_id):
         return None
@@ -84,8 +85,11 @@ async def create_mood_entry(
         updated_by_user_id=user_id,
     )
     db.add(mood)
-    await db.commit()
-    await db.refresh(mood)
+    if autocommit:
+        await db.commit()
+        await db.refresh(mood)
+    else:
+        await db.flush()
     return mood
 
 
