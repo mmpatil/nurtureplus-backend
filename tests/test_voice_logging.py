@@ -103,6 +103,91 @@ def test_analyze_voice_transcript_parses_simple_diaper():
     assert result.actions[0].payload["diaper_type"] == "wet"
 
 
+def test_analyze_voice_transcript_expands_counted_diapers_into_separate_actions():
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="2 wet diapers and one dirty diaper",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 17, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "created"
+    assert [action.payload["diaper_type"] for action in result.actions] == ["wet", "wet", "dirty"]
+
+
+def test_analyze_voice_transcript_parses_single_wet_and_dirty_diaper_as_both():
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="one wet and dirty diaper",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 17, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "created"
+    assert [action.payload["diaper_type"] for action in result.actions] == ["both"]
+
+
+def test_analyze_voice_transcript_expands_counted_wet_and_dirty_diapers():
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="2 wet and dirty diapers",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 17, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "created"
+    assert [action.payload["diaper_type"] for action in result.actions] == ["both", "both"]
+
+
+def test_analyze_voice_transcript_expands_diapers_with_shared_timestamp():
+    client_now = datetime(2026, 6, 7, 18, 0, tzinfo=timezone.utc)
+    transcript = "2 wet diapers and a dirty diaper around 3"
+
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript=transcript,
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=client_now,
+        )
+    )
+
+    expected_timestamp = voice_logging._resolve_single_timestamp(
+        transcript.lower(),
+        "America/Los_Angeles",
+        client_now,
+    )
+
+    assert result.status == "created"
+    assert [action.payload["diaper_type"] for action in result.actions] == ["wet", "wet", "dirty"]
+    assert all(action.validated_payload is not None for action in result.actions)
+    assert [action.validated_payload.timestamp for action in result.actions] == [
+        expected_timestamp,
+        expected_timestamp,
+        expected_timestamp,
+    ]
+
+
+def test_analyze_voice_transcript_returns_confirmation_for_ambiguous_diapers():
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="wet and dirty diapers",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 17, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "needs_confirmation"
+    assert result.actions == []
+
+
 def test_analyze_voice_transcript_parses_simple_sleep():
     result = _run(
         voice_logging.analyze_voice_transcript(
@@ -487,6 +572,65 @@ def test_route_autosaves_multiple_actions(client, monkeypatch):
 
     assert response.status_code == 200
     assert len(response.json()["created_actions"]) == 2
+
+
+def test_route_autosaves_expanded_diaper_actions_in_order(client, monkeypatch):
+    from app.api import routes
+
+    user = _make_user()
+    fake_db = FakeDB()
+    baby_id = uuid4()
+    now = datetime.now(timezone.utc)
+
+    async def fake_create_voice_logs(**kwargs):
+        actions = kwargs["actions"]
+        assert [action.validated_payload.diaper_type for action in actions] == ["wet", "wet", "dirty"]
+
+        created_actions = []
+        for action in actions:
+            resource = SimpleNamespace(
+                id=uuid4(),
+                baby_id=baby_id,
+                diaper_type=action.validated_payload.diaper_type,
+                timestamp=action.validated_payload.timestamp,
+                notes=action.validated_payload.notes,
+                created_by_user_id=user.id,
+                updated_by_user_id=user.id,
+                created_at=now,
+                updated_at=now,
+            )
+            created_actions.append(
+                voice_logging.CreatedVoiceAction(
+                    log_type=VoiceLogType.diaper,
+                    confidence=action.confidence,
+                    resource=resource,
+                )
+            )
+        return created_actions
+
+    async def fake_require_baby_edit_permission(*_args, **_kwargs):
+        return None
+
+    app.dependency_overrides[get_current_user] = _override_user(user)
+    app.dependency_overrides[get_db] = _override_db(fake_db)
+    monkeypatch.setattr(routes.voice_logging_crud, "create_voice_logs", fake_create_voice_logs)
+    monkeypatch.setattr(routes, "require_baby_edit_permission", fake_require_baby_edit_permission)
+    monkeypatch.setattr(routes, "_serialize_entry_with_audit", _stub_serialize_entry_with_audit)
+
+    response = client.post(
+        "/voice/logs",
+        json={
+            "transcript": "2 wet diapers and one dirty diaper",
+            "baby_id": str(baby_id),
+            "timezone": "America/Los_Angeles",
+            "client_now": now.isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "created"
+    assert [item["resource"]["diaper_type"] for item in payload["created_actions"]] == ["wet", "wet", "dirty"]
 
 
 def test_route_returns_needs_confirmation_without_saving(client, monkeypatch):

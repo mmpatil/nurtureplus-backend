@@ -112,6 +112,14 @@ RECOVERY_SYMPTOMS = {
     "hot flashes": "hotFlashes",
 }
 
+DIAPER_AMBIGUITY_MESSAGE = "Voice note needs confirmation before saving diaper logs."
+DIAPER_EVENT_PATTERN = re.compile(
+    r"(?P<count>\b(?:\d+|one|a|an)\b)?\s*"
+    r"(?P<first>wet|dirty|dry)"
+    r"(?:\s+and\s+(?P<second>wet|dirty|dry))?"
+    r"\s+(?P<noun>diaper|diapers)\b"
+)
+
 
 @dataclass
 class ParsedVoiceAction:
@@ -155,6 +163,13 @@ class CreatedVoiceAction:
     log_type: VoiceLogType
     confidence: float
     resource: Any
+
+
+@dataclass
+class DeterministicParseResult:
+    actions: list[ParsedVoiceAction] = field(default_factory=list)
+    force_confirmation: bool = False
+    message: str | None = None
 
 
 class OpenAIVoiceExtractor:
@@ -235,6 +250,9 @@ class OpenAIVoiceExtractor:
             "Supported log types: feeding, diaper, sleep, mood, recovery, growth, milestone.\n"
             "Use existing create-schema field names only.\n"
             "For baby-scoped logs, do not include baby_id inside payload.\n"
+            "Each action must represent exactly one final log to create.\n"
+            "Repeat actions instead of using aggregated counts.\n"
+            "For diaper logs, use `both` only when the same diaper event is explicitly both wet and dirty.\n"
             "If a required field is missing, leave it out of payload and list it in missing_fields.\n"
             "Confidence must be between 0 and 1.\n"
             "Return JSON only."
@@ -274,8 +292,17 @@ async def analyze_voice_transcript(
 ) -> VoiceAnalysisResult:
     normalized = _normalize_transcript(transcript)
     segments = _split_into_segments(normalized)
-    deterministic_actions = _parse_deterministic_actions(segments, timezone_name, client_now)
-    validated_deterministic = [_validate_action(action, baby_id) for action in deterministic_actions]
+    deterministic_result = _parse_deterministic_actions(segments, timezone_name, client_now)
+    if isinstance(deterministic_result, list):
+        deterministic_result = DeterministicParseResult(actions=deterministic_result)
+    validated_deterministic = [_validate_action(action, baby_id) for action in deterministic_result.actions]
+
+    if deterministic_result.force_confirmation:
+        return VoiceAnalysisResult(
+            status=CONFIRMATION_STATUS,
+            message=deterministic_result.message or "Voice note needs confirmation before saving.",
+            actions=validated_deterministic,
+        )
 
     llm_actions: list[ParsedVoiceAction] = []
     if _should_use_llm(normalized, validated_deterministic):
@@ -435,21 +462,34 @@ def _parse_deterministic_actions(
     segments: list[str],
     timezone_name: str,
     client_now: datetime,
-) -> list[ParsedVoiceAction]:
-    actions: list[ParsedVoiceAction] = []
+) -> DeterministicParseResult:
+    result = DeterministicParseResult()
     for segment in segments:
+        action = _parse_feeding(segment, timezone_name, client_now)
+        if action:
+            result.actions.append(action)
+            continue
+
+        diaper_result = _parse_diaper_actions(segment, timezone_name, client_now)
+        if diaper_result.force_confirmation:
+            result.actions.extend(diaper_result.actions)
+            result.force_confirmation = True
+            result.message = diaper_result.message
+            return result
+        if diaper_result.actions:
+            result.actions.extend(diaper_result.actions)
+            continue
+
         action = (
-            _parse_feeding(segment, timezone_name, client_now)
-            or _parse_diaper(segment, timezone_name, client_now)
-            or _parse_sleep(segment, timezone_name, client_now)
+            _parse_sleep(segment, timezone_name, client_now)
             or _parse_mood(segment, timezone_name, client_now)
             or _parse_recovery(segment, timezone_name, client_now)
             or _parse_growth(segment, timezone_name, client_now)
             or _parse_milestone(segment, timezone_name, client_now)
         )
         if action:
-            actions.append(action)
-    return actions
+            result.actions.append(action)
+    return result
 
 
 def _parse_feeding(segment: str, timezone_name: str, client_now: datetime) -> ParsedVoiceAction | None:
@@ -496,10 +536,49 @@ def _parse_feeding(segment: str, timezone_name: str, client_now: datetime) -> Pa
     )
 
 
-def _parse_diaper(segment: str, timezone_name: str, client_now: datetime) -> ParsedVoiceAction | None:
+def _parse_diaper_actions(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+) -> DeterministicParseResult:
     if not any(keyword in segment for keyword in ("diaper", "poop", "pooped", "wet", "pee")):
-        return None
+        return DeterministicParseResult()
+
     timestamp = _resolve_single_timestamp(segment, timezone_name, client_now)
+    notes = _extract_notes(segment)
+    normalized_segment = _normalize_diaper_segment(_strip_notes_clause(segment))
+    matches = list(DIAPER_EVENT_PATTERN.finditer(normalized_segment))
+
+    if matches:
+        actions: list[ParsedVoiceAction] = []
+        for match in matches:
+            diaper_types = _expand_diaper_event(match)
+            if diaper_types is None:
+                return DeterministicParseResult(
+                    actions=actions,
+                    force_confirmation=True,
+                    message=DIAPER_AMBIGUITY_MESSAGE,
+                )
+            for diaper_type in diaper_types:
+                actions.append(
+                    ParsedVoiceAction(
+                        log_type=VoiceLogType.diaper,
+                        confidence=0.96,
+                        payload={
+                            "diaper_type": diaper_type,
+                            "timestamp": timestamp,
+                            "notes": notes,
+                        },
+                    )
+                )
+        return DeterministicParseResult(actions=actions)
+
+    if _is_ambiguous_diaper_phrase(normalized_segment):
+        return DeterministicParseResult(
+            force_confirmation=True,
+            message=DIAPER_AMBIGUITY_MESSAGE,
+        )
+
     diaper_type = "wet"
     if any(keyword in segment for keyword in ("dirty", "poop", "pooped")) and any(keyword in segment for keyword in ("wet", "pee")):
         diaper_type = "both"
@@ -507,15 +586,69 @@ def _parse_diaper(segment: str, timezone_name: str, client_now: datetime) -> Par
         diaper_type = "dirty"
     elif "dry diaper" in segment:
         diaper_type = "dry"
-    notes = _extract_notes(segment)
-    return ParsedVoiceAction(
-        log_type=VoiceLogType.diaper,
-        confidence=0.96,
-        payload={
-            "diaper_type": diaper_type,
-            "timestamp": timestamp,
-            "notes": notes,
-        },
+
+    return DeterministicParseResult(
+        actions=[
+            ParsedVoiceAction(
+                log_type=VoiceLogType.diaper,
+                confidence=0.96,
+                payload={
+                    "diaper_type": diaper_type,
+                    "timestamp": timestamp,
+                    "notes": notes,
+                },
+            )
+        ]
+    )
+
+
+def _expand_diaper_event(match: re.Match[str]) -> list[str] | None:
+    count = _parse_spoken_count(match.group("count")) or 1
+    first = match.group("first")
+    second = match.group("second")
+    noun = match.group("noun")
+
+    if second:
+        diaper_types = {first, second}
+        if diaper_types == {"wet", "dirty"}:
+            if match.group("count") is None and noun == "diapers":
+                return None
+            return ["both"] * count
+        if len(diaper_types) == 1:
+            return [first] * count
+        return None
+
+    return [first] * count
+
+
+def _parse_spoken_count(value: str | None) -> int | None:
+    if value is None:
+        return None
+    if value.isdigit():
+        return int(value)
+    return {
+        "a": 1,
+        "an": 1,
+        "one": 1,
+    }.get(value)
+
+
+def _normalize_diaper_segment(segment: str) -> str:
+    normalized = re.sub(r"\bpooped\b", "dirty diaper", segment)
+    normalized = re.sub(r"\bpoop\b", "dirty diaper", normalized)
+    normalized = re.sub(r"\bpeed\b", "wet diaper", normalized)
+    normalized = re.sub(r"\bpee\b", "wet diaper", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _strip_notes_clause(segment: str) -> str:
+    return re.sub(r"(?:notes?|note)\s*[:\-]\s*.+$", "", segment).strip()
+
+
+def _is_ambiguous_diaper_phrase(segment: str) -> bool:
+    return (
+        ("wet and dirty diapers" in segment or "dirty and wet diapers" in segment)
+        and "diaper" in segment
     )
 
 
