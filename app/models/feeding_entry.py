@@ -2,7 +2,7 @@ from __future__ import annotations
 """Feeding entry database model."""
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Index, Text
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Index, Text, Float
 from sqlalchemy.dialects.postgresql import UUID
 from app.db.base import Base
 
@@ -25,8 +25,20 @@ class FeedingEntry(Base):
         index=True,
     )
     feeding_type: str = Column(String(50), nullable=False)  # bottle, breast_left, breast_right, both
+    feeding_category: str = Column(String(50), nullable=True)
+    feeding_subtype: str = Column(String(50), nullable=True)
+    food_name: str = Column(String(255), nullable=True)
+    brand_name: str = Column(String(255), nullable=True)
     amount_ml: int = Column(Integer, nullable=True)  # Amount in milliliters
+    amount_value: float = Column(Float, nullable=True)
+    amount_unit: str = Column(String(30), nullable=True)
     duration_min: int = Column(Integer, nullable=True)  # Duration in minutes
+    serving_count_offered: float = Column(Float, nullable=True)
+    serving_count_consumed: float = Column(Float, nullable=True)
+    consumed_fraction: float = Column(Float, nullable=True)
+    analysis_status: str = Column(String(30), nullable=True)
+    analysis_confidence: float = Column(Float, nullable=True)
+    nutrition_source: str = Column(String(30), nullable=True)
     timestamp: datetime = Column(
         DateTime(timezone=True),
         nullable=False,

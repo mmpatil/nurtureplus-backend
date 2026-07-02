@@ -45,11 +45,25 @@ from app.crud import growth_entries as growth_crud
 from app.crud import milestone_entries as milestone_crud
 from app.crud import baby_access as baby_access_crud
 from app.crud import account_deletion as account_deletion_crud
+from app.crud import food_intelligence as food_intelligence_crud
 from app.crud import voice_logging as voice_logging_crud
-from app.schemas.feeding import Feeding, FeedingCreate, FeedingUpdate, FeedingListResponse
+from app.schemas.feeding import (
+    Feeding,
+    FeedingAnalysisRequest,
+    FeedingAnalysisResponse,
+    FeedingConfirmRequest,
+    FeedingCreate,
+    FeedingListResponse,
+    FeedingMedia as FeedingMediaSchema,
+    FeedingNutritionEstimate as FeedingNutritionEstimateSchema,
+    FeedingOptionsResponse,
+    FeedingUpdate,
+)
 from app.schemas.diaper import Diaper, DiaperCreate, DiaperUpdate, DiaperListResponse
 from app.schemas.sleep import Sleep, SleepCreate, SleepUpdate, SleepListResponse
+from app.schemas.food_profile import BabyFoodProfileResponse, BabyFoodProfileUpdate
 from app.schemas.mood import Mood, MoodCreate, MoodUpdate, MoodListResponse
+from app.schemas.product_analysis import ProductAnalysisRequest, ProductAnalysisResponse
 from app.schemas.recovery import (
     RecoveryEntryCreate,
     RecoveryEntryResponse,
@@ -58,6 +72,7 @@ from app.schemas.recovery import (
     RecoverySummaryResponse,
 )
 from app.models.feeding_entry import FeedingEntry
+from app.models.feeding_nutrition_estimate import FeedingNutritionEstimate
 from app.models.diaper_entry import DiaperEntry
 from app.models.sleep_entry import SleepEntry
 from app.models.babies import Baby as BabyModel
@@ -152,16 +167,26 @@ async def _serialize_entry_with_audit(
     cache: dict[UUID, UserSummary | None] | None = None,
 ):
     schema = schema_cls.model_validate(entry)
-    return schema.model_copy(
-        update={
-            "created_by": await _resolve_user_summary(
-                db, getattr(entry, "created_by_user_id", None), cache
-            ),
-            "updated_by": await _resolve_user_summary(
-                db, getattr(entry, "updated_by_user_id", None), cache
-            ),
-        }
-    )
+    update_payload = {
+        "created_by": await _resolve_user_summary(
+            db, getattr(entry, "created_by_user_id", None), cache
+        ),
+        "updated_by": await _resolve_user_summary(
+            db, getattr(entry, "updated_by_user_id", None), cache
+        ),
+    }
+    if schema_cls is Feeding and isinstance(entry, FeedingEntry):
+        media = await feeding_crud.list_feeding_media(db, entry.id)
+        nutrition_estimate = await feeding_crud.get_feeding_nutrition_estimate(db, entry.id)
+        update_payload["media"] = [
+            FeedingMediaSchema.model_validate(item) for item in media
+        ]
+        update_payload["nutrition_estimate"] = (
+            FeedingNutritionEstimateSchema.model_validate(nutrition_estimate)
+            if nutrition_estimate
+            else None
+        )
+    return schema.model_copy(update=update_payload)
 
 
 async def _serialize_entries_with_audit(
@@ -747,6 +772,48 @@ async def remove_caregiver(
 # Feeding Endpoints
 # ---------------------------------------------------------------------------
 
+@router.get("/babies/{baby_id}/feeding-options", tags=["feedings"], response_model=FeedingOptionsResponse)
+async def get_feeding_options(
+    baby_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FeedingOptionsResponse:
+    baby_uuid = _parse_uuid(baby_id, "baby ID")
+    await check_baby_access(db, baby_uuid, current_user.id)
+    options = await feeding_crud.get_feeding_options_for_baby(db, baby_uuid, current_user.id)
+    if options is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Baby not found")
+    return FeedingOptionsResponse(
+        baby_id=baby_uuid,
+        age_months=options.age_months,
+        age_band=options.age_band,
+        options=options.options,
+    )
+
+
+@router.get("/babies/{baby_id}/food-profile", tags=["feedings"], response_model=BabyFoodProfileResponse)
+async def get_baby_food_profile(
+    baby_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> BabyFoodProfileResponse:
+    baby_uuid = _parse_uuid(baby_id, "baby ID")
+    await check_baby_access(db, baby_uuid, current_user.id)
+    return await food_intelligence_crud.get_baby_food_profile(db, baby_uuid)
+
+
+@router.put("/babies/{baby_id}/food-profile", tags=["feedings"], response_model=BabyFoodProfileResponse)
+async def update_baby_food_profile(
+    baby_id: str,
+    body: BabyFoodProfileUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> BabyFoodProfileResponse:
+    baby_uuid = _parse_uuid(baby_id, "baby ID")
+    await require_baby_edit_permission(db, baby_uuid, current_user)
+    return await food_intelligence_crud.update_baby_food_profile(db, baby_uuid, body)
+
+
 @router.get("/babies/{baby_id}/feedings", tags=["feedings"], response_model=FeedingListResponse)
 async def list_feedings(
     baby_id: str,
@@ -789,6 +856,50 @@ async def create_feeding(
     if not feeding:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Baby not found")
     return await _serialize_entry_with_audit(db, feeding, Feeding)
+
+
+@router.post(
+    "/babies/{baby_id}/feedings/analyze",
+    tags=["feedings"],
+    response_model=FeedingAnalysisResponse,
+)
+async def analyze_feeding(
+    baby_id: str,
+    body: FeedingAnalysisRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FeedingAnalysisResponse:
+    baby_uuid = _parse_uuid(baby_id, "baby ID")
+    await require_baby_edit_permission(db, baby_uuid, current_user)
+    try:
+        return await food_intelligence_crud.analyze_feeding(db, baby_uuid, current_user.id, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+
+@router.post(
+    "/babies/{baby_id}/feedings/confirm",
+    tags=["feedings"],
+    response_model=Feeding,
+    status_code=status.HTTP_201_CREATED,
+)
+async def confirm_feeding_analysis(
+    baby_id: str,
+    body: FeedingConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Feeding:
+    baby_uuid = _parse_uuid(baby_id, "baby ID")
+    await require_baby_edit_permission(db, baby_uuid, current_user)
+    try:
+        return await food_intelligence_crud.confirm_feeding_analysis(
+            db,
+            baby_uuid,
+            current_user.id,
+            body,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
 
 @router.put("/feedings/{feeding_id}", tags=["feedings"], response_model=Feeding)
@@ -836,6 +947,18 @@ async def delete_feeding(
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feeding not found")
     return None
+
+
+@router.post("/food-products/analyze", tags=["feedings"], response_model=ProductAnalysisResponse)
+async def analyze_food_product(
+    body: ProductAnalysisRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProductAnalysisResponse:
+    try:
+        return await food_intelligence_crud.analyze_product(db, current_user.id, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1307,6 +1430,24 @@ async def get_analytics_summary(
 
     avg_sleep_hours = round(total_sleep_minutes / 60.0 / max(range_days, 1), 1)
 
+    nutrition_totals_result = await db.execute(
+        select(
+            func.coalesce(func.sum(FeedingNutritionEstimate.calories), 0),
+            func.coalesce(func.sum(FeedingNutritionEstimate.protein_g), 0),
+            func.coalesce(func.sum(FeedingNutritionEstimate.iron_mg), 0),
+            func.coalesce(func.sum(FeedingNutritionEstimate.calcium_mg), 0),
+            func.count(FeedingNutritionEstimate.id),
+        )
+        .join(FeedingEntry, FeedingEntry.id == FeedingNutritionEstimate.feeding_id)
+        .where(
+            FeedingNutritionEstimate.baby_id == baby_uuid,
+            FeedingEntry.timestamp >= start_date,
+        )
+    )
+    calories_total, protein_total, iron_total, calcium_total, analyzed_feedings = (
+        nutrition_totals_result.one()
+    )
+
     return {
         "rangeDays": range_days,
         "feedingCountByDay": feeding_by_day,
@@ -1316,6 +1457,13 @@ async def get_analytics_summary(
             "feedings": total_feedings,
             "diapers": total_diapers,
             "avgSleepHoursPerDay": avg_sleep_hours,
+        },
+        "nutritionTotals": {
+            "calories": round(float(calories_total or 0), 2),
+            "protein_g": round(float(protein_total or 0), 2),
+            "iron_mg": round(float(iron_total or 0), 2),
+            "calcium_mg": round(float(calcium_total or 0), 2),
+            "analyzedFeedings": int(analyzed_feedings or 0),
         },
     }
 

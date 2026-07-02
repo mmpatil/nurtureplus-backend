@@ -12,7 +12,9 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.babies import Baby
+from app.models.feeding_media import FeedingMedia
 from app.models.milestone_entry import MilestoneEntry
+from app.models.product_analysis import ProductAnalysis
 from app.models.users import User
 
 logger = logging.getLogger(__name__)
@@ -23,12 +25,17 @@ ACCOUNT_DATA_TABLES = [
     "babies",
     "baby_access",
     "feeding_entries",
+    "feeding_media",
+    "feeding_nutrition_estimates",
     "diaper_entries",
     "sleep_entries",
     "mood_entries",
     "growth_entries",
     "milestone_entries",
     "recovery_entries",
+    "baby_food_profiles",
+    "product_analyses",
+    "product_suitability_assessments",
 ]
 
 
@@ -75,6 +82,12 @@ async def _get_storage_urls_for_owned_data(
             MilestoneEntry.photo_url.is_not(None),
         )
     )
+    feeding_media_result = await db.execute(
+        select(FeedingMedia.media_url).where(
+            FeedingMedia.baby_id.in_(baby_ids),  # noqa: SIM118
+            FeedingMedia.media_url.is_not(None),
+        )
+    )
 
     urls: list[str] = []
     for value in baby_result.scalars().all():
@@ -83,6 +96,28 @@ async def _get_storage_urls_for_owned_data(
     for value in milestone_result.scalars().all():
         if value:
             urls.append(value)
+    for value in feeding_media_result.scalars().all():
+        if value:
+            urls.append(value)
+    return urls
+
+
+async def _get_storage_urls_for_user_analyses(
+    db: AsyncSession,
+    user_id: UUID,
+) -> list[str]:
+    result = await db.execute(
+        select(ProductAnalysis.package_front_url, ProductAnalysis.package_back_url).where(
+            ProductAnalysis.user_id == user_id
+        )
+    )
+    urls: list[str] = []
+    rows = result.all() if hasattr(result, "all") else []
+    for front_url, back_url in rows:
+        if front_url:
+            urls.append(front_url)
+        if back_url:
+            urls.append(back_url)
     return urls
 
 
@@ -247,6 +282,7 @@ async def delete_local_account_data(
     """
     owned_baby_ids = await _get_owned_baby_ids(db, user.id)
     storage_urls = await _get_storage_urls_for_owned_data(db, owned_baby_ids)
+    storage_urls.extend(await _get_storage_urls_for_user_analyses(db, user.id))
 
     try:
         deleted_storage_count = _delete_storage_data(
