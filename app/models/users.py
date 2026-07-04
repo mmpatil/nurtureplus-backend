@@ -24,6 +24,8 @@ class User(Base):
     display_name: str = Column(String(255), nullable=True)
     # True when Firebase sign-in provider is "anonymous"
     is_anonymous: bool = Column(Boolean, nullable=False, default=False)
+    # Internal platform admin flag for additive features such as Groups.
+    is_admin: bool = Column(Boolean, nullable=False, default=False)
     created_at: datetime = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

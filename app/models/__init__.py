@@ -2,6 +2,13 @@
 from app.models.users import User
 from app.models.babies import Baby
 from app.models.baby_access import BabyAccess
+from app.models.group import Group
+from app.models.group_tag import GroupTag
+from app.models.group_membership import GroupMembership
+from app.models.group_message import GroupMessage
+from app.models.group_message_attachment import GroupMessageAttachment
+from app.models.group_request import GroupRequest
+from app.models.group_request_tag import GroupRequestTag
 from app.models.baby_food_profile import BabyFoodProfile
 from app.models.feeding_entry import FeedingEntry
 from app.models.feeding_media import FeedingMedia
@@ -19,6 +26,13 @@ __all__ = [
     "User",
     "Baby",
     "BabyAccess",
+    "Group",
+    "GroupTag",
+    "GroupMembership",
+    "GroupMessage",
+    "GroupMessageAttachment",
+    "GroupRequest",
+    "GroupRequestTag",
     "BabyFoodProfile",
     "FeedingEntry",
     "FeedingMedia",

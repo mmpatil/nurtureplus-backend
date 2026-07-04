@@ -19,6 +19,13 @@ from app.core.access import (
     require_baby_edit_permission,
     require_non_anonymous,
 )
+from app.core.group_access import (
+    get_group_membership_for_user,
+    require_group_account,
+    require_group_member_or_admin,
+    require_platform_admin,
+)
+from app.core import group_firestore
 from app.db.session import get_db
 from app.models.users import User
 from app.models.baby_access import BabyAccess
@@ -34,6 +41,32 @@ from app.schemas.caregiver import (
     InvitePreview,
     InviteAcceptRequest,
 )
+from app.schemas.group import (
+    Group as GroupSchema,
+    GroupBanListResponse,
+    GroupBanRequest,
+    GroupCreate,
+    GroupListResponse,
+    GroupMember,
+    GroupMemberListResponse,
+    GroupMembershipResponse,
+    GroupMessageAttachment as GroupMessageAttachmentSchema,
+    GroupMessage as GroupMessageSchema,
+    GroupMessageCreate,
+    GroupMessageListResponse,
+    GroupRequest as GroupRequestSchema,
+    GroupRequestApprove,
+    GroupRequestCreate,
+    GroupRequestListResponse,
+    GroupRequestMerge,
+    GroupRequestReject,
+    GroupRequestResolutionResponse,
+    GroupState as GroupStateSchema,
+    GroupStateUpdate,
+    GroupStatus,
+    GroupUpdate,
+    GroupUserSummary,
+)
 from app.crud import babies as babies_crud
 from app.crud import users as users_crud
 from app.crud import feeding_entries as feeding_crud
@@ -46,6 +79,7 @@ from app.crud import milestone_entries as milestone_crud
 from app.crud import baby_access as baby_access_crud
 from app.crud import account_deletion as account_deletion_crud
 from app.crud import food_intelligence as food_intelligence_crud
+from app.crud import groups as groups_crud
 from app.crud import voice_logging as voice_logging_crud
 from app.schemas.feeding import (
     Feeding,
@@ -231,6 +265,284 @@ async def _resolve_caregiver_entry(
         updated_at=row.updated_at,
         user=await _resolve_user_summary(db, row.user_id),
     )
+
+
+def _group_user_to_summary(user: User) -> GroupUserSummary:
+    return GroupUserSummary(
+        id=user.id,
+        display_name=user.display_name,
+    )
+
+
+async def _resolve_group_user_summaries(
+    db: AsyncSession,
+    user_ids: list[UUID],
+) -> dict[UUID, GroupUserSummary]:
+    unique_user_ids = list({user_id for user_id in user_ids if user_id is not None})
+    if not unique_user_ids:
+        return {}
+
+    result = await db.execute(
+        select(User).where(User.id.in_(unique_user_ids))
+    )
+    return {user.id: _group_user_to_summary(user) for user in result.scalars().all()}
+
+
+async def _resolve_group_users(
+    db: AsyncSession,
+    user_ids: list[UUID],
+) -> dict[UUID, User]:
+    unique_user_ids = list({user_id for user_id in user_ids if user_id is not None})
+    if not unique_user_ids:
+        return {}
+
+    result = await db.execute(select(User).where(User.id.in_(unique_user_ids)))
+    return {user.id: user for user in result.scalars().all()}
+
+
+def _normalize_group_tag(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = " ".join(value.strip().lower().split())
+    return cleaned or None
+
+
+def _serialize_group(
+    group,
+    tags_by_group: dict[UUID, list[str]],
+    member_counts: dict[UUID, int],
+    memberships_by_group: dict[UUID, object] | None = None,
+) -> GroupSchema:
+    membership = memberships_by_group.get(group.id) if memberships_by_group else None
+    membership_status = getattr(membership, "status", None)
+    can_join = (
+        group.status == "active"
+        and membership_status not in {"active", "banned"}
+    )
+    return GroupSchema(
+        id=group.id,
+        name=group.name,
+        description=group.description,
+        status=group.status,
+        primary_category=group.primary_category,
+        custom_category_label=group.custom_category_label,
+        locality_label=group.locality_label,
+        city=group.city,
+        state=group.state,
+        country=group.country,
+        tags=tags_by_group.get(group.id, []),
+        member_count=member_counts.get(group.id, 0),
+        membership_status=membership_status,
+        can_join=can_join,
+        created_at=group.created_at,
+        updated_at=group.updated_at,
+    )
+
+
+async def _serialize_groups(
+    db: AsyncSession,
+    groups: list,
+    current_user: User,
+) -> list[GroupSchema]:
+    group_ids = [group.id for group in groups]
+    tags_by_group = await groups_crud.get_group_tags_map(db, group_ids)
+    member_counts = await groups_crud.get_active_member_counts(db, group_ids)
+    memberships_by_group = await groups_crud.get_memberships_for_user(
+        db, group_ids, current_user.id
+    )
+    return [
+        _serialize_group(group, tags_by_group, member_counts, memberships_by_group)
+        for group in groups
+    ]
+
+
+def _serialize_group_membership(row) -> GroupMembershipResponse:
+    return GroupMembershipResponse.model_validate(row)
+
+
+async def _serialize_group_member_entries(
+    db: AsyncSession,
+    memberships: list,
+) -> list[GroupMember]:
+    user_map = await _resolve_group_user_summaries(
+        db,
+        [row.user_id for row in memberships],
+    )
+    return [
+        GroupMember(
+            id=row.id,
+            group_id=row.group_id,
+            user_id=row.user_id,
+            status=row.status,
+            joined_at=row.joined_at,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            user=user_map.get(row.user_id),
+        )
+        for row in memberships
+    ]
+
+
+async def _serialize_group_messages(
+    db: AsyncSession,
+    messages: list,
+) -> list[GroupMessageSchema]:
+    message_ids = [message.id for message in messages]
+    attachments_by_message = await groups_crud.get_message_attachments_map(db, message_ids)
+    sender_map = await _resolve_group_user_summaries(
+        db,
+        [message.sender_user_id for message in messages],
+    )
+    return [
+        GroupMessageSchema(
+            id=message.id,
+            group_id=message.group_id,
+            sender_user_id=message.sender_user_id,
+            body=message.body,
+            status=message.status,
+            removed_at=message.removed_at,
+            removal_reason=message.removal_reason,
+            created_at=message.created_at,
+            updated_at=message.updated_at,
+            sender=sender_map.get(message.sender_user_id),
+            attachments=[
+                GroupMessageAttachmentSchema.model_validate(attachment)
+                for attachment in attachments_by_message.get(message.id, [])
+            ],
+        )
+        for message in messages
+    ]
+
+
+async def _serialize_group_requests(
+    db: AsyncSession,
+    requests: list,
+) -> list[GroupRequestSchema]:
+    request_ids = [request.id for request in requests]
+    tags_by_request = await groups_crud.get_group_request_tags_map(db, request_ids)
+    requester_ids = [request.requester_user_id for request in requests]
+    resolver_ids = [
+        request.resolved_by_user_id for request in requests if request.resolved_by_user_id
+    ]
+    user_map = await _resolve_group_user_summaries(db, requester_ids + resolver_ids)
+    return [
+        GroupRequestSchema(
+            id=request.id,
+            requester_user_id=request.requester_user_id,
+            name=request.name,
+            description=request.description,
+            primary_category=request.primary_category,
+            custom_category_label=request.custom_category_label,
+            locality_label=request.locality_label,
+            city=request.city,
+            state=request.state,
+            country=request.country,
+            tags=tags_by_request.get(request.id, []),
+            request_note=request.request_note,
+            status=request.status,
+            resolution_note=request.resolution_note,
+            resolved_group_id=request.resolved_group_id,
+            resolved_at=request.resolved_at,
+            created_at=request.created_at,
+            updated_at=request.updated_at,
+            requester=user_map.get(request.requester_user_id),
+            resolved_by=user_map.get(request.resolved_by_user_id),
+        )
+        for request in requests
+    ]
+
+
+def _default_group_state_payload(
+    *,
+    last_activity_at: datetime | None = None,
+    notifications_enabled: bool = True,
+    last_read_message_id: UUID | None = None,
+    unread_count: int = 0,
+) -> dict:
+    return {
+        "unread_count": unread_count,
+        "notifications_enabled": notifications_enabled,
+        "last_read_message_id": str(last_read_message_id) if last_read_message_id else None,
+        "last_activity_at": (
+            last_activity_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if last_activity_at
+            else None
+        ),
+    }
+
+
+def _state_payload_to_schema(group_id: UUID, payload: dict | None) -> GroupStateSchema:
+    payload = payload or {}
+    last_activity_at = payload.get("last_activity_at")
+    if isinstance(last_activity_at, str):
+        last_activity_at = date_parser.isoparse(last_activity_at)
+    elif last_activity_at is not None and not isinstance(last_activity_at, datetime):
+        last_activity_at = None
+
+    return GroupStateSchema(
+        group_id=group_id,
+        unread_count=max(int(payload.get("unread_count") or 0), 0),
+        notifications_enabled=bool(payload.get("notifications_enabled", True)),
+        last_read_message_id=payload.get("last_read_message_id"),
+        last_activity_at=last_activity_at,
+    )
+
+
+async def _get_or_seed_group_state(
+    db: AsyncSession,
+    group_id: UUID,
+    current_user: User,
+    membership,
+) -> GroupStateSchema:
+    try:
+        await group_firestore.upsert_group_member(current_user, membership)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=ensure_member group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+
+    state_payload = None
+    try:
+        state_payload = await group_firestore.get_group_state_document(
+            current_user.firebase_uid,
+            group_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=get_state group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+
+    if state_payload is None:
+        latest_message = await groups_crud.get_latest_active_group_message(db, group_id)
+        default_payload = _default_group_state_payload(
+            last_activity_at=(
+                latest_message.created_at
+                if latest_message is not None
+                else membership.joined_at
+            ) or datetime.now(timezone.utc),
+        )
+        try:
+            await group_firestore.set_group_state_document(
+                current_user.firebase_uid,
+                group_id,
+                default_payload,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Group Firestore sync failed operation=seed_state group_id=%s user_id=%s firebase_uid=%s",
+                group_id,
+                current_user.id,
+                current_user.firebase_uid,
+            )
+        state_payload = default_payload
+
+    return _state_payload_to_schema(group_id, state_payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1624,3 +1936,884 @@ async def delete_milestone_entry(
     )
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Milestone entry not found")
+
+
+# ---------------------------------------------------------------------------
+# Groups Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/groups", tags=["groups"], response_model=GroupListResponse)
+async def list_groups(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    search: Optional[str] = Query(None),
+    primary_category: Optional[str] = Query(None),
+    tag: Optional[str] = Query(None),
+    city: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    country: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> GroupListResponse:
+    require_group_account(current_user)
+    groups, total = await groups_crud.list_groups(
+        db,
+        search=search,
+        primary_category=primary_category,
+        tag=_normalize_group_tag(tag),
+        city=city,
+        state=state,
+        country=country,
+        limit=limit,
+        offset=offset,
+    )
+    return GroupListResponse(
+        items=await _serialize_groups(db, groups, current_user),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/groups/mine", tags=["groups"], response_model=GroupListResponse)
+async def list_my_groups(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> GroupListResponse:
+    require_group_account(current_user)
+    groups, total = await groups_crud.list_user_groups(
+        db,
+        user_id=current_user.id,
+        limit=limit,
+        offset=offset,
+    )
+    return GroupListResponse(
+        items=await _serialize_groups(db, groups, current_user),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/groups/requests", tags=["groups"], response_model=GroupRequestSchema, status_code=status.HTTP_201_CREATED)
+async def create_group_request(
+    body: GroupRequestCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupRequestSchema:
+    require_group_account(current_user)
+    request = await groups_crud.create_group_request(db, current_user.id, body)
+    return (await _serialize_group_requests(db, [request]))[0]
+
+
+@router.get("/groups/requests/mine", tags=["groups"], response_model=GroupRequestListResponse)
+async def list_my_group_requests(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> GroupRequestListResponse:
+    require_group_account(current_user)
+    requests, total = await groups_crud.list_group_requests_for_user(
+        db,
+        current_user.id,
+        limit,
+        offset,
+    )
+    return GroupRequestListResponse(
+        items=await _serialize_group_requests(db, requests),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/groups/{group_id}", tags=["groups"], response_model=GroupSchema)
+async def get_group(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupSchema:
+    require_group_account(current_user)
+    group = await groups_crud.get_group_by_id(db, group_id)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+
+    membership = await get_group_membership_for_user(db, group_id, current_user.id)
+    if (
+        group.status != "active"
+        and not current_user.is_admin
+        and not (membership and membership.status == "active")
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+
+    tags_by_group = await groups_crud.get_group_tags_map(db, [group.id])
+    member_counts = await groups_crud.get_active_member_counts(db, [group.id])
+    memberships_by_group = {group.id: membership} if membership else {}
+    return _serialize_group(group, tags_by_group, member_counts, memberships_by_group)
+
+
+@router.get("/groups/{group_id}/members", tags=["groups"], response_model=GroupMemberListResponse)
+async def list_group_members(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupMemberListResponse:
+    require_group_account(current_user)
+    await require_group_member_or_admin(db, group_id, current_user)
+    memberships = await groups_crud.list_group_members(db, group_id)
+    return GroupMemberListResponse(
+        items=await _serialize_group_member_entries(db, memberships),
+        total=len(memberships),
+    )
+
+
+@router.post("/groups/{group_id}/join", tags=["groups"], response_model=GroupMembershipResponse)
+async def join_group(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupMembershipResponse:
+    require_group_account(current_user)
+    membership, error = await groups_crud.join_group(db, group_id, current_user.id)
+    if error == "Group not found":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+    if error == "You are banned from this group":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=error)
+    if error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error)
+
+    try:
+        await group_firestore.upsert_group_member(current_user, membership)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=join_member group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+    try:
+        await group_firestore.set_group_state_document(
+            current_user.firebase_uid,
+            group_id,
+            _default_group_state_payload(last_activity_at=membership.joined_at),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=join_state group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+
+    return _serialize_group_membership(membership)
+
+
+@router.delete("/groups/{group_id}/membership", tags=["groups"], status_code=status.HTTP_204_NO_CONTENT)
+async def leave_group(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_group_account(current_user)
+    membership, error = await groups_crud.leave_group(db, group_id, current_user.id)
+    if error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+
+    try:
+        await group_firestore.delete_group_member(group_id, current_user.firebase_uid)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=leave_member group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+
+    try:
+        existing_state = await group_firestore.get_group_state_document(
+            current_user.firebase_uid,
+            group_id,
+        )
+        notifications_enabled = True
+        last_read_message_id = None
+        last_activity_at = membership.left_at
+        if existing_state:
+            notifications_enabled = bool(existing_state.get("notifications_enabled", True))
+            last_read_message_id = existing_state.get("last_read_message_id")
+            last_activity_raw = existing_state.get("last_activity_at")
+            if isinstance(last_activity_raw, str):
+                last_activity_at = date_parser.isoparse(last_activity_raw)
+        await group_firestore.set_group_state_document(
+            current_user.firebase_uid,
+            group_id,
+            _default_group_state_payload(
+                last_activity_at=last_activity_at,
+                notifications_enabled=notifications_enabled,
+                last_read_message_id=(
+                    UUID(last_read_message_id) if last_read_message_id else None
+                ),
+                unread_count=0,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=leave_state group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+    return None
+
+
+@router.get("/groups/{group_id}/messages", tags=["groups"], response_model=GroupMessageListResponse)
+async def list_group_messages(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> GroupMessageListResponse:
+    require_group_account(current_user)
+    await require_group_member_or_admin(db, group_id, current_user)
+    messages, total = await groups_crud.list_group_messages(db, group_id, limit, offset)
+    return GroupMessageListResponse(
+        items=await _serialize_group_messages(db, messages),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/groups/{group_id}/messages", tags=["groups"], response_model=GroupMessageSchema, status_code=status.HTTP_201_CREATED)
+async def create_group_message(
+    group_id: UUID,
+    body: GroupMessageCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupMessageSchema:
+    require_group_account(current_user)
+    group = await groups_crud.get_group_by_id(db, group_id)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    if group.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Messages can only be sent to active groups",
+        )
+
+    membership = await get_group_membership_for_user(db, group_id, current_user.id)
+    if membership is None or membership.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only active group members can send messages",
+        )
+
+    message = await groups_crud.create_group_message(db, group_id, current_user.id, body)
+    serialized_message = (await _serialize_group_messages(db, [message]))[0]
+
+    try:
+        await group_firestore.upsert_group_message(serialized_message)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=message_write group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+
+    try:
+        await group_firestore.set_group_state_document(
+            current_user.firebase_uid,
+            group_id,
+            _default_group_state_payload(
+                last_activity_at=message.created_at,
+                last_read_message_id=message.id,
+                unread_count=0,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=message_sender_state group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+
+    try:
+        active_memberships = await groups_crud.list_active_group_memberships(db, group_id)
+        users_by_id = await _resolve_group_users(
+            db,
+            [row.user_id for row in active_memberships if row.user_id != current_user.id],
+        )
+        for membership_row in active_memberships:
+            if membership_row.user_id == current_user.id:
+                continue
+            member_user = users_by_id.get(membership_row.user_id)
+            if member_user is None or not member_user.firebase_uid:
+                continue
+            existing_state = await group_firestore.get_group_state_document(
+                member_user.firebase_uid,
+                group_id,
+            )
+            notifications_enabled = True
+            last_read_message_id = None
+            unread_count = 1
+            if existing_state:
+                notifications_enabled = bool(existing_state.get("notifications_enabled", True))
+                last_read_message_id = existing_state.get("last_read_message_id")
+                unread_count = max(int(existing_state.get("unread_count") or 0), 0) + 1
+            await group_firestore.set_group_state_document(
+                member_user.firebase_uid,
+                group_id,
+                _default_group_state_payload(
+                    last_activity_at=message.created_at,
+                    notifications_enabled=notifications_enabled,
+                    last_read_message_id=(
+                        UUID(last_read_message_id) if last_read_message_id else None
+                    ),
+                    unread_count=unread_count,
+                ),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=message_fanout group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+
+    return serialized_message
+
+
+@router.get("/groups/{group_id}/state", tags=["groups"], response_model=GroupStateSchema)
+async def get_group_state(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupStateSchema:
+    require_group_account(current_user)
+    group = await groups_crud.get_group_by_id(db, group_id)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+
+    membership = await get_group_membership_for_user(db, group_id, current_user.id)
+    if membership is None or membership.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only active group members can access this resource",
+        )
+
+    return await _get_or_seed_group_state(db, group_id, current_user, membership)
+
+
+@router.put("/groups/{group_id}/state", tags=["groups"], response_model=GroupStateSchema)
+async def update_group_state(
+    group_id: UUID,
+    body: GroupStateUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupStateSchema:
+    require_group_account(current_user)
+    group = await groups_crud.get_group_by_id(db, group_id)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+
+    membership = await get_group_membership_for_user(db, group_id, current_user.id)
+    if membership is None or membership.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only active group members can access this resource",
+        )
+
+    current_state = await _get_or_seed_group_state(db, group_id, current_user, membership)
+    notifications_enabled = current_state.notifications_enabled
+    unread_count = current_state.unread_count
+    last_read_message_id = current_state.last_read_message_id
+    last_activity_at = current_state.last_activity_at
+    provided_fields = body.model_fields_set
+
+    if "notifications_enabled" in provided_fields and body.notifications_enabled is not None:
+        notifications_enabled = body.notifications_enabled
+
+    if body.mark_all_read:
+        latest_message = await groups_crud.get_latest_active_group_message(db, group_id)
+        unread_count = 0
+        last_read_message_id = latest_message.id if latest_message else None
+        last_activity_at = latest_message.created_at if latest_message else last_activity_at
+    elif "last_read_message_id" in provided_fields:
+        if body.last_read_message_id is None:
+            unread_count = await groups_crud.count_active_messages_after(db, group_id, None)
+            last_read_message_id = None
+            latest_message = await groups_crud.get_latest_active_group_message(db, group_id)
+            last_activity_at = latest_message.created_at if latest_message else last_activity_at
+        else:
+            last_read_message = await groups_crud.get_group_message_by_id(
+                db,
+                group_id,
+                body.last_read_message_id,
+            )
+            if last_read_message is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="last_read_message_id must belong to this group",
+                )
+            unread_count = await groups_crud.count_active_messages_after(
+                db,
+                group_id,
+                last_read_message,
+            )
+            last_read_message_id = last_read_message.id
+            latest_message = await groups_crud.get_latest_active_group_message(db, group_id)
+            last_activity_at = latest_message.created_at if latest_message else last_activity_at
+
+    updated_payload = _default_group_state_payload(
+        last_activity_at=last_activity_at,
+        notifications_enabled=notifications_enabled,
+        last_read_message_id=last_read_message_id,
+        unread_count=unread_count,
+    )
+
+    try:
+        await group_firestore.set_group_state_document(
+            current_user.firebase_uid,
+            group_id,
+            updated_payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=update_state group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+
+    return _state_payload_to_schema(group_id, updated_payload)
+
+
+# ---------------------------------------------------------------------------
+# Groups Admin Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/groups", tags=["groups-admin"], response_model=GroupListResponse)
+async def list_admin_groups(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    status_value: Optional[GroupStatus] = Query(None, alias="status"),
+    search: Optional[str] = Query(None),
+    primary_category: Optional[str] = Query(None),
+    city: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    country: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> GroupListResponse:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    groups, total = await groups_crud.list_admin_groups(
+        db,
+        status_value=status_value,
+        search=search,
+        primary_category=primary_category,
+        city=city,
+        state=state,
+        country=country,
+        limit=limit,
+        offset=offset,
+    )
+    return GroupListResponse(
+        items=await _serialize_groups(db, groups, current_user),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/admin/groups", tags=["groups-admin"], response_model=GroupSchema, status_code=status.HTTP_201_CREATED)
+async def create_admin_group(
+    body: GroupCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupSchema:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    group = await groups_crud.create_group(db, current_user.id, body)
+    tags_by_group = await groups_crud.get_group_tags_map(db, [group.id])
+    member_counts = await groups_crud.get_active_member_counts(db, [group.id])
+    return _serialize_group(group, tags_by_group, member_counts)
+
+
+@router.get("/admin/groups/requests", tags=["groups-admin"], response_model=GroupRequestListResponse)
+async def list_admin_group_requests(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    status_value: Optional[str] = Query(None, alias="status"),
+    search: Optional[str] = Query(None),
+    primary_category: Optional[str] = Query(None),
+    city: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    country: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> GroupRequestListResponse:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    requests, total = await groups_crud.list_group_requests(
+        db,
+        status_value=status_value,
+        search=search,
+        primary_category=primary_category,
+        city=city,
+        state=state,
+        country=country,
+        limit=limit,
+        offset=offset,
+    )
+    return GroupRequestListResponse(
+        items=await _serialize_group_requests(db, requests),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post(
+    "/admin/groups/requests/{request_id}/approve",
+    tags=["groups-admin"],
+    response_model=GroupRequestResolutionResponse,
+)
+async def approve_group_request(
+    request_id: UUID,
+    body: GroupRequestApprove,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupRequestResolutionResponse:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    request, group, requester_joined, error = await groups_crud.approve_group_request(
+        db, request_id, current_user.id, body
+    )
+    if error == "Group request not found":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+    if error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error)
+
+    serialized_request = (await _serialize_group_requests(db, [request]))[0]
+    serialized_group = (await _serialize_groups(db, [group], current_user))[0]
+    if requester_joined:
+        requester_user = await users_crud.get_user_by_id(db, str(request.requester_user_id))
+        requester_membership = await get_group_membership_for_user(db, group.id, request.requester_user_id)
+        if requester_user is not None and requester_membership is not None:
+            try:
+                await group_firestore.upsert_group_member(requester_user, requester_membership)
+                await group_firestore.set_group_state_document(
+                    requester_user.firebase_uid,
+                    group.id,
+                    _default_group_state_payload(last_activity_at=requester_membership.joined_at),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Group Firestore sync failed operation=approve_join group_id=%s user_id=%s firebase_uid=%s",
+                    group.id,
+                    requester_user.id,
+                    requester_user.firebase_uid,
+                )
+    return GroupRequestResolutionResponse(
+        request=serialized_request,
+        group=serialized_group,
+        requester_joined=requester_joined,
+    )
+
+
+@router.post(
+    "/admin/groups/requests/{request_id}/reject",
+    tags=["groups-admin"],
+    response_model=GroupRequestResolutionResponse,
+)
+async def reject_group_request(
+    request_id: UUID,
+    body: GroupRequestReject,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupRequestResolutionResponse:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    request, error = await groups_crud.reject_group_request(
+        db, request_id, current_user.id, body
+    )
+    if error == "Group request not found":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+    if error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error)
+
+    serialized_request = (await _serialize_group_requests(db, [request]))[0]
+    return GroupRequestResolutionResponse(
+        request=serialized_request,
+        group=None,
+        requester_joined=False,
+    )
+
+
+@router.post(
+    "/admin/groups/requests/{request_id}/merge",
+    tags=["groups-admin"],
+    response_model=GroupRequestResolutionResponse,
+)
+async def merge_group_request(
+    request_id: UUID,
+    body: GroupRequestMerge,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupRequestResolutionResponse:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    request, group, requester_joined, error = await groups_crud.merge_group_request(
+        db, request_id, current_user.id, body
+    )
+    if error in {"Group request not found", "Target group not found"}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+    if error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error)
+
+    serialized_request = (await _serialize_group_requests(db, [request]))[0]
+    serialized_group = (await _serialize_groups(db, [group], current_user))[0]
+    if requester_joined:
+        requester_user = await users_crud.get_user_by_id(db, str(request.requester_user_id))
+        requester_membership = await get_group_membership_for_user(db, group.id, request.requester_user_id)
+        if requester_user is not None and requester_membership is not None:
+            try:
+                await group_firestore.upsert_group_member(requester_user, requester_membership)
+                await group_firestore.set_group_state_document(
+                    requester_user.firebase_uid,
+                    group.id,
+                    _default_group_state_payload(last_activity_at=requester_membership.joined_at),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Group Firestore sync failed operation=merge_join group_id=%s user_id=%s firebase_uid=%s",
+                    group.id,
+                    requester_user.id,
+                    requester_user.firebase_uid,
+                )
+    return GroupRequestResolutionResponse(
+        request=serialized_request,
+        group=serialized_group,
+        requester_joined=requester_joined,
+    )
+
+
+@router.get("/admin/groups/{group_id}", tags=["groups-admin"], response_model=GroupSchema)
+async def get_admin_group(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupSchema:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    group = await groups_crud.get_group_by_id(db, group_id)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    tags_by_group = await groups_crud.get_group_tags_map(db, [group.id])
+    member_counts = await groups_crud.get_active_member_counts(db, [group.id])
+    memberships_by_group = await groups_crud.get_memberships_for_user(db, [group.id], current_user.id)
+    return _serialize_group(group, tags_by_group, member_counts, memberships_by_group)
+
+
+@router.put("/admin/groups/{group_id}", tags=["groups-admin"], response_model=GroupSchema)
+async def update_admin_group(
+    group_id: UUID,
+    body: GroupUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupSchema:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    group, error = await groups_crud.update_group(db, group_id, current_user.id, body)
+    if error == "Group not found":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+    if error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error)
+    tags_by_group = await groups_crud.get_group_tags_map(db, [group.id])
+    member_counts = await groups_crud.get_active_member_counts(db, [group.id])
+    memberships_by_group = await groups_crud.get_memberships_for_user(db, [group.id], current_user.id)
+    return _serialize_group(group, tags_by_group, member_counts, memberships_by_group)
+
+
+@router.post("/admin/groups/{group_id}/archive", tags=["groups-admin"], response_model=GroupSchema)
+async def archive_group(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupSchema:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    group = await groups_crud.set_group_status(db, group_id, current_user.id, "archived")
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    try:
+        active_memberships = await groups_crud.list_active_group_memberships(db, group_id)
+        users_by_id = await _resolve_group_users(db, [row.user_id for row in active_memberships])
+        await group_firestore.delete_group_members(
+            group_id,
+            [
+                user.firebase_uid
+                for row in active_memberships
+                if (user := users_by_id.get(row.user_id)) is not None and user.firebase_uid
+            ],
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=archive_group group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+    tags_by_group = await groups_crud.get_group_tags_map(db, [group.id])
+    member_counts = await groups_crud.get_active_member_counts(db, [group.id])
+    memberships_by_group = await groups_crud.get_memberships_for_user(db, [group.id], current_user.id)
+    return _serialize_group(group, tags_by_group, member_counts, memberships_by_group)
+
+
+@router.post("/admin/groups/{group_id}/reactivate", tags=["groups-admin"], response_model=GroupSchema)
+async def reactivate_group(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupSchema:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    group = await groups_crud.set_group_status(db, group_id, current_user.id, "active")
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    tags_by_group = await groups_crud.get_group_tags_map(db, [group.id])
+    member_counts = await groups_crud.get_active_member_counts(db, [group.id])
+    memberships_by_group = await groups_crud.get_memberships_for_user(db, [group.id], current_user.id)
+    return _serialize_group(group, tags_by_group, member_counts, memberships_by_group)
+
+
+@router.get("/admin/groups/{group_id}/bans", tags=["groups-admin"], response_model=GroupBanListResponse)
+async def list_group_bans(
+    group_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupBanListResponse:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    group = await groups_crud.get_group_by_id(db, group_id)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    memberships = await groups_crud.list_banned_members(db, group_id)
+    return GroupBanListResponse(
+        items=await _serialize_group_member_entries(db, memberships),
+        total=len(memberships),
+    )
+
+
+@router.post("/admin/groups/{group_id}/members/{user_id}/ban", tags=["groups-admin"], response_model=GroupMembershipResponse)
+async def ban_group_member(
+    group_id: UUID,
+    user_id: UUID,
+    body: GroupBanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupMembershipResponse:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    membership, error = await groups_crud.ban_group_member(
+        db,
+        group_id,
+        user_id,
+        current_user.id,
+        body.ban_reason,
+    )
+    if error in {"Group not found", "User not found"}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+    if error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error)
+    target_user = await users_crud.get_user_by_id(db, str(user_id))
+    if target_user is not None:
+        try:
+            await group_firestore.delete_group_member(group_id, target_user.firebase_uid)
+            existing_state = await group_firestore.get_group_state_document(
+                target_user.firebase_uid,
+                group_id,
+            )
+            notifications_enabled = (
+                bool(existing_state.get("notifications_enabled", True))
+                if existing_state
+                else True
+            )
+            last_read_message_id = (
+                existing_state.get("last_read_message_id")
+                if existing_state
+                else None
+            )
+            await group_firestore.set_group_state_document(
+                target_user.firebase_uid,
+                group_id,
+                _default_group_state_payload(
+                    last_activity_at=membership.banned_at,
+                    notifications_enabled=notifications_enabled,
+                    last_read_message_id=(
+                        UUID(last_read_message_id) if last_read_message_id else None
+                    ),
+                    unread_count=0,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Group Firestore sync failed operation=ban_member group_id=%s user_id=%s firebase_uid=%s",
+                group_id,
+                user_id,
+                target_user.firebase_uid,
+            )
+    return _serialize_group_membership(membership)
+
+
+@router.delete("/admin/groups/{group_id}/members/{user_id}/ban", tags=["groups-admin"], response_model=GroupMembershipResponse)
+async def unban_group_member(
+    group_id: UUID,
+    user_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> GroupMembershipResponse:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    membership, error = await groups_crud.unban_group_member(db, group_id, user_id)
+    if error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+    return _serialize_group_membership(membership)
+
+
+@router.delete("/admin/groups/{group_id}/messages/{message_id}", tags=["groups-admin"], response_model=GroupMessageSchema)
+async def remove_group_message(
+    group_id: UUID,
+    message_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    removal_reason: Optional[str] = Query(None, max_length=1000),
+) -> GroupMessageSchema:
+    require_group_account(current_user)
+    require_platform_admin(current_user)
+    message, error = await groups_crud.remove_group_message(
+        db,
+        group_id,
+        message_id,
+        current_user.id,
+        removal_reason,
+    )
+    if error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
+    serialized_message = (await _serialize_group_messages(db, [message]))[0]
+    try:
+        await group_firestore.remove_group_message(serialized_message)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Group Firestore sync failed operation=remove_message group_id=%s user_id=%s firebase_uid=%s",
+            group_id,
+            current_user.id,
+            current_user.firebase_uid,
+        )
+    return serialized_message

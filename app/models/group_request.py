@@ -1,0 +1,71 @@
+from __future__ import annotations
+"""User-submitted request to create a community group."""
+
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import Column, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy.dialects.postgresql import UUID
+
+from app.db.base import Base
+
+
+class GroupRequest(Base):
+    """Stores a user's request for admins to create a new group."""
+
+    __tablename__ = "group_requests"
+
+    id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        nullable=False,
+    )
+    requester_user_id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: str = Column(String(120), nullable=False)
+    description: str = Column(Text, nullable=True)
+    primary_category: str = Column(String(40), nullable=False)
+    custom_category_label: str = Column(String(100), nullable=True)
+    locality_label: str = Column(String(150), nullable=True)
+    city: str = Column(String(100), nullable=True)
+    state: str = Column(String(100), nullable=True)
+    country: str = Column(String(100), nullable=True)
+    request_note: str = Column(Text, nullable=True)
+    status: str = Column(String(20), nullable=False, default="pending")
+    resolution_note: str = Column(Text, nullable=True)
+    resolved_by_user_id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    resolved_group_id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        ForeignKey("groups.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    resolved_at: datetime = Column(DateTime(timezone=True), nullable=True)
+    created_at: datetime = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: datetime = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_group_requests_status", "status"),
+        Index("ix_group_requests_primary_category", "primary_category"),
+        Index("ix_group_requests_city_state_country", "city", "state", "country"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GroupRequest(id={self.id}, requester={self.requester_user_id}, status={self.status})>"
