@@ -1,7 +1,7 @@
 from __future__ import annotations
 """CRUD operations for growth entries — membership-aware."""
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from uuid import UUID
 
 from sqlalchemy import select, func, delete
@@ -13,6 +13,10 @@ from app.crud._baby_access_check import verify_baby_access
 from app.schemas.growth import GrowthCreate, GrowthUpdate
 
 logger = logging.getLogger(__name__)
+
+
+def _as_utc_midnight(value: date) -> datetime:
+    return datetime.combine(value, time.min, tzinfo=timezone.utc)
 
 
 async def get_growth_entries_for_baby(
@@ -69,7 +73,7 @@ async def create_growth_entry(
 
     entry = GrowthEntry(
         baby_id=baby_id,
-        measurement_date=growth_create.measurement_date,
+        measurement_date=_as_utc_midnight(growth_create.measurement_date),
         weight_kg=growth_create.weight_kg,
         height_cm=growth_create.height_cm,
         head_circumference_cm=growth_create.head_circumference_cm,
@@ -101,6 +105,8 @@ async def update_growth_entry(
         return None
 
     for key, value in growth_update.model_dump(exclude_unset=True).items():
+        if key == "measurement_date" and value is not None:
+            value = _as_utc_midnight(value)
         setattr(entry, key, value)
 
     entry.updated_at = datetime.now(timezone.utc)

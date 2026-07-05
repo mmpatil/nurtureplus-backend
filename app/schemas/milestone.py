@@ -4,7 +4,7 @@ from datetime import date, datetime
 from enum import Enum
 from uuid import UUID
 from typing import Optional
-from pydantic import BaseModel, Field, AnyHttpUrl
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 from app.schemas.user import UserSummary
 
 
@@ -24,6 +24,13 @@ class MilestoneBase(BaseModel):
     achieved_date: date = Field(..., description="Date milestone was achieved")
     notes: Optional[str] = Field(None, max_length=500, description="Optional notes")
     photo_url: Optional[AnyHttpUrl] = Field(None, description="Firebase Storage download URL for milestone photo")
+
+    @field_validator("achieved_date", mode="before")
+    @classmethod
+    def coerce_achieved_date(cls, value: date | datetime) -> date:
+        if isinstance(value, datetime):
+            return value.date()
+        return value
 
 
 class MilestoneCreate(MilestoneBase):
@@ -51,8 +58,7 @@ class Milestone(MilestoneBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class MilestoneListResponse(BaseModel):

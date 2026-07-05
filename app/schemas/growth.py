@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from uuid import UUID
 from typing import Optional
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from app.schemas.user import UserSummary
 
 
@@ -20,6 +20,13 @@ class GrowthBase(BaseModel):
         if self.weight_kg is None and self.height_cm is None and self.head_circumference_cm is None:
             raise ValueError("At least one of weight_kg, height_cm, or head_circumference_cm must be provided")
         return self
+
+    @field_validator("measurement_date", mode="before")
+    @classmethod
+    def coerce_measurement_date(cls, value: date | datetime) -> date:
+        if isinstance(value, datetime):
+            return value.date()
+        return value
 
 
 class GrowthCreate(GrowthBase):
@@ -47,8 +54,7 @@ class Growth(GrowthBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class GrowthListResponse(BaseModel):

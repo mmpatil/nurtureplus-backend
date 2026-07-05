@@ -14,6 +14,8 @@ from app.crud import voice_logging
 from app.db.session import get_db
 from app.main import app
 from app.models.users import User
+from app.schemas.milestone import Milestone
+from app.schemas.growth import Growth
 from app.schemas.voice import VoiceLogType
 
 
@@ -574,6 +576,76 @@ def test_route_autosaves_multiple_actions(client, monkeypatch):
     assert len(response.json()["created_actions"]) == 2
 
 
+def test_route_autosaves_growth_even_when_resource_has_datetime_measurement_date(client, monkeypatch):
+    from app.api import routes
+
+    user = _make_user()
+    fake_db = FakeDB()
+    baby_id = uuid4()
+    now = datetime.now(timezone.utc)
+    measurement_dt = datetime(2026, 7, 4, 21, 59, 17, tzinfo=timezone.utc)
+
+    async def fake_analyze_voice_transcript(**_kwargs):
+        action = voice_logging.ParsedVoiceAction(
+            log_type=VoiceLogType.growth,
+            confidence=0.95,
+            payload={
+                "measurement_date": "2026-07-04",
+                "weight_kg": 10.0,
+                "height_cm": 70.0,
+                "head_circumference_cm": 43.0,
+            },
+            validated_payload=voice_logging.GrowthCreate(
+                measurement_date=measurement_dt.date(),
+                weight_kg=10.0,
+                height_cm=70.0,
+                head_circumference_cm=43.0,
+                notes=None,
+            ),
+        )
+        return voice_logging.VoiceAnalysisResult(status="created", message="ok", actions=[action])
+
+    async def fake_create_voice_logs(**_kwargs):
+        resource = SimpleNamespace(
+            id=uuid4(),
+            baby_id=baby_id,
+            measurement_date=measurement_dt,
+            weight_kg=10.0,
+            height_cm=70.0,
+            head_circumference_cm=43.0,
+            notes=None,
+            created_by_user_id=None,
+            updated_by_user_id=None,
+            created_at=now,
+            updated_at=now,
+        )
+        return [voice_logging.CreatedVoiceAction(log_type=VoiceLogType.growth, confidence=0.95, resource=resource)]
+
+    async def fake_require_baby_edit_permission(*_args, **_kwargs):
+        return None
+
+    app.dependency_overrides[get_current_user] = _override_user(user)
+    app.dependency_overrides[get_db] = _override_db(fake_db)
+    monkeypatch.setattr(routes.voice_logging_crud, "analyze_voice_transcript", fake_analyze_voice_transcript)
+    monkeypatch.setattr(routes.voice_logging_crud, "create_voice_logs", fake_create_voice_logs)
+    monkeypatch.setattr(routes, "require_baby_edit_permission", fake_require_baby_edit_permission)
+
+    response = client.post(
+        "/voice/logs",
+        json={
+            "transcript": "weight 10kg 40 percentile height 13 percentile head circumference 8 percentile",
+            "baby_id": str(baby_id),
+            "timezone": "America/Los_Angeles",
+            "client_now": now.isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "created"
+    assert payload["created_actions"][0]["resource"]["measurement_date"] == "2026-07-04"
+
+
 def test_route_autosaves_expanded_diaper_actions_in_order(client, monkeypatch):
     from app.api import routes
 
@@ -808,6 +880,50 @@ def test_route_rejects_unauthorized_baby_access(client, monkeypatch):
     )
 
     assert response.status_code == 404
+
+
+def test_growth_schema_coerces_datetime_measurement_date():
+    now = datetime.now(timezone.utc)
+
+    growth = Growth.model_validate(
+        SimpleNamespace(
+            id=uuid4(),
+            baby_id=uuid4(),
+            measurement_date=datetime(2026, 7, 4, 21, 59, 17, tzinfo=timezone.utc),
+            weight_kg=10.0,
+            height_cm=70.0,
+            head_circumference_cm=43.0,
+            notes=None,
+            created_by_user_id=None,
+            updated_by_user_id=None,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    assert growth.measurement_date.isoformat() == "2026-07-04"
+
+
+def test_milestone_schema_coerces_datetime_achieved_date():
+    now = datetime.now(timezone.utc)
+
+    milestone = Milestone.model_validate(
+        SimpleNamespace(
+            id=uuid4(),
+            baby_id=uuid4(),
+            title="Rolled over",
+            category="motor",
+            achieved_date=datetime(2026, 7, 4, 21, 59, 17, tzinfo=timezone.utc),
+            notes=None,
+            photo_url=None,
+            created_by_user_id=None,
+            updated_by_user_id=None,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    assert milestone.achieved_date.isoformat() == "2026-07-04"
 
 
 def _async_return(value):

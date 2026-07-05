@@ -1,7 +1,7 @@
 from __future__ import annotations
 """CRUD operations for milestone entries — membership-aware."""
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from uuid import UUID
 
 from sqlalchemy import select, func, delete
@@ -13,6 +13,10 @@ from app.crud._baby_access_check import verify_baby_access
 from app.schemas.milestone import MilestoneCreate, MilestoneUpdate
 
 logger = logging.getLogger(__name__)
+
+
+def _as_utc_midnight(value: date) -> datetime:
+    return datetime.combine(value, time.min, tzinfo=timezone.utc)
 
 
 async def get_milestone_entries_for_baby(
@@ -71,7 +75,7 @@ async def create_milestone_entry(
         baby_id=baby_id,
         title=milestone_create.title,
         category=milestone_create.category,
-        achieved_date=milestone_create.achieved_date,
+        achieved_date=_as_utc_midnight(milestone_create.achieved_date),
         notes=milestone_create.notes,
         photo_url=str(milestone_create.photo_url) if milestone_create.photo_url else None,
         created_by_user_id=user_id,
@@ -100,7 +104,9 @@ async def update_milestone_entry(
     if not is_owner and entry.created_by_user_id != user_id:
         return None
 
-    for key, value in milestone_update.model_dump(exclude_unset=True, mode="json").items():
+    for key, value in milestone_update.model_dump(exclude_unset=True).items():
+        if key == "achieved_date" and value is not None:
+            value = _as_utc_midnight(value)
         setattr(entry, key, value)
 
     entry.updated_at = datetime.now(timezone.utc)
