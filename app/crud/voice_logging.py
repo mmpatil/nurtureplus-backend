@@ -114,10 +114,27 @@ RECOVERY_SYMPTOMS = {
 
 DIAPER_AMBIGUITY_MESSAGE = "Voice note needs confirmation before saving diaper logs."
 DIAPER_EVENT_PATTERN = re.compile(
+    r"(?:(?:first|second|seconds|third|another|next|last|2nd|3rd)\s+)?"
     r"(?P<count>\b(?:\d+|one|a|an)\b)?\s*"
     r"(?P<first>wet|dirty|dry)"
     r"(?:\s+and\s+(?P<second>wet|dirty|dry))?"
     r"\s+(?P<noun>diaper|diapers)\b"
+)
+COARSE_SEGMENT_SEPARATORS = r"(?:;|\. |\n|, then | and then | after that | also )"
+SUBJECT_PREFIX_PATTERN = re.compile(
+    r"^(?:(?:the\s+)?baby|mom|mother|i|we|he|she)\s+(?:has|have|had|is|was)\s+"
+)
+TIME_AMPM_PATTERN = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b")
+TIME_CONTEXTUAL_PATTERN = re.compile(r"\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\b")
+RELATIVE_DATE_PATTERN = re.compile(
+    r"\b(?:today|yesterday|tomorrow)(?:\s+(?:morning|afternoon|evening|night|tonight))?\b"
+)
+PART_OF_DAY_PATTERN = re.compile(r"\b(?:morning|afternoon|evening|night|tonight)\b")
+ISO_DATE_PATTERN = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+SLASH_DATE_PATTERN = re.compile(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b")
+MONTH_NAME_PATTERN = re.compile(
+    r"\b(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|"
+    r"aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b"
 )
 
 
@@ -170,6 +187,7 @@ class DeterministicParseResult:
     actions: list[ParsedVoiceAction] = field(default_factory=list)
     force_confirmation: bool = False
     message: str | None = None
+    recognized_clause_count: int = 0
 
 
 class OpenAIVoiceExtractor:
@@ -294,7 +312,10 @@ async def analyze_voice_transcript(
     segments = _split_into_segments(normalized)
     deterministic_result = _parse_deterministic_actions(segments, timezone_name, client_now)
     if isinstance(deterministic_result, list):
-        deterministic_result = DeterministicParseResult(actions=deterministic_result)
+        deterministic_result = DeterministicParseResult(
+            actions=deterministic_result,
+            recognized_clause_count=len(deterministic_result),
+        )
     validated_deterministic = [_validate_action(action, baby_id) for action in deterministic_result.actions]
 
     if deterministic_result.force_confirmation:
@@ -305,7 +326,11 @@ async def analyze_voice_transcript(
         )
 
     llm_actions: list[ParsedVoiceAction] = []
-    if _should_use_llm(normalized, validated_deterministic):
+    if _should_use_llm(
+        normalized,
+        validated_deterministic,
+        recognized_clause_count=deterministic_result.recognized_clause_count,
+    ):
         llm_actions = await _extract_with_llm(transcript, timezone_name, client_now, baby_id)
         llm_actions = [_validate_action(action, baby_id) for action in llm_actions]
 
@@ -423,12 +448,19 @@ def _choose_actions(
     return deterministic_actions
 
 
-def _should_use_llm(normalized_transcript: str, actions: list[ParsedVoiceAction]) -> bool:
+def _should_use_llm(
+    normalized_transcript: str,
+    actions: list[ParsedVoiceAction],
+    *,
+    recognized_clause_count: int = 0,
+) -> bool:
     if not actions:
         return True
     if any(action.missing_fields for action in actions):
         return True
     if any(action.confidence < settings.voice_autosave_threshold for action in actions):
+        return True
+    if recognized_clause_count > len(actions):
         return True
     if _indicates_multiple_actions(normalized_transcript) and len(actions) < 2:
         return True
@@ -442,9 +474,14 @@ def _average_confidence(actions: list[ParsedVoiceAction]) -> float:
 
 
 def _indicates_multiple_actions(transcript: str) -> bool:
-    return any(
+    if any(
         phrase in transcript
         for phrase in (" and then ", " also ", ";", ". ", ", then ", " after that ")
+    ):
+        return True
+    return any(
+        len(_split_segment_into_clauses(_strip_notes_clause(segment))) > 1
+        for segment in _split_into_segments(transcript)
     )
 
 
@@ -453,9 +490,39 @@ def _normalize_transcript(transcript: str) -> str:
 
 
 def _split_into_segments(transcript: str) -> list[str]:
-    separators = r"(?:;|\. |\n|, then | and then | after that | also )"
-    segments = [segment.strip(" ,.") for segment in re.split(separators, transcript) if segment.strip(" ,.")] 
+    segments = [segment.strip(" ,.") for segment in re.split(COARSE_SEGMENT_SEPARATORS, transcript) if segment.strip(" ,.")]
     return segments or [transcript]
+
+
+def _split_segment_into_clauses(segment: str) -> list[str]:
+    cleaned = segment.strip(" ,.")
+    if not cleaned:
+        return []
+
+    split_points: list[tuple[int, int]] = []
+    for match in re.finditer(r"\band\b", cleaned):
+        left = cleaned[:match.start()].rstrip()
+        right = cleaned[match.end():].lstrip()
+        if not right or _is_same_event_connector(left, right):
+            continue
+        if _starts_new_event_clause(right):
+            split_points.append((match.start(), match.end()))
+
+    if not split_points:
+        return [cleaned]
+
+    clauses: list[str] = []
+    start = 0
+    for split_start, split_end in split_points:
+        clause = cleaned[start:split_start].strip(" ,.")
+        if clause:
+            clauses.append(clause)
+        start = split_end
+
+    tail = cleaned[start:].strip(" ,.")
+    if tail:
+        clauses.append(tail)
+    return clauses or [cleaned]
 
 
 def _parse_deterministic_actions(
@@ -465,37 +532,120 @@ def _parse_deterministic_actions(
 ) -> DeterministicParseResult:
     result = DeterministicParseResult()
     for segment in segments:
-        action = _parse_feeding(segment, timezone_name, client_now)
-        if action:
-            result.actions.append(action)
-            continue
-
-        diaper_result = _parse_diaper_actions(segment, timezone_name, client_now)
-        if diaper_result.force_confirmation:
-            result.actions.extend(diaper_result.actions)
-            result.force_confirmation = True
-            result.message = diaper_result.message
-            return result
-        if diaper_result.actions:
-            result.actions.extend(diaper_result.actions)
-            continue
-
-        action = (
-            _parse_sleep(segment, timezone_name, client_now)
-            or _parse_mood(segment, timezone_name, client_now)
-            or _parse_recovery(segment, timezone_name, client_now)
-            or _parse_growth(segment, timezone_name, client_now)
-            or _parse_milestone(segment, timezone_name, client_now)
+        shared_notes = _extract_notes(segment)
+        segment_without_notes = _strip_notes_clause(segment)
+        clauses = _split_segment_into_clauses(segment_without_notes)
+        result.recognized_clause_count += len(clauses)
+        shared_timestamp = _resolve_shared_segment_timestamp(
+            segment_without_notes,
+            clauses,
+            timezone_name,
+            client_now,
         )
-        if action:
-            result.actions.append(action)
+
+        for clause in clauses:
+            clause_result = _parse_single_clause(
+                clause,
+                timezone_name,
+                client_now,
+                default_timestamp=shared_timestamp,
+                default_notes=shared_notes,
+            )
+            result.actions.extend(clause_result.actions)
+            if clause_result.force_confirmation:
+                result.force_confirmation = True
+                result.message = clause_result.message
+                return result
     return result
 
 
-def _parse_feeding(segment: str, timezone_name: str, client_now: datetime) -> ParsedVoiceAction | None:
+def _parse_single_clause(
+    clause: str,
+    timezone_name: str,
+    client_now: datetime,
+    *,
+    default_timestamp: datetime | None,
+    default_notes: str | None,
+) -> DeterministicParseResult:
+    action = _parse_feeding(
+        clause,
+        timezone_name,
+        client_now,
+        default_timestamp=default_timestamp,
+        default_notes=default_notes,
+    )
+    if action:
+        return DeterministicParseResult(actions=[action], recognized_clause_count=1)
+
+    diaper_result = _parse_diaper_actions(
+        clause,
+        timezone_name,
+        client_now,
+        default_timestamp=default_timestamp,
+        default_notes=default_notes,
+    )
+    if diaper_result.force_confirmation or diaper_result.actions:
+        diaper_result.recognized_clause_count = 1
+        return diaper_result
+
+    action = (
+        _parse_sleep(
+            clause,
+            timezone_name,
+            client_now,
+            default_timestamp=default_timestamp,
+            default_notes=default_notes,
+        )
+        or _parse_mood(
+            clause,
+            timezone_name,
+            client_now,
+            default_timestamp=default_timestamp,
+            default_notes=default_notes,
+        )
+        or _parse_recovery(
+            clause,
+            timezone_name,
+            client_now,
+            default_timestamp=default_timestamp,
+            default_notes=default_notes,
+        )
+        or _parse_growth(
+            clause,
+            timezone_name,
+            client_now,
+            default_timestamp=default_timestamp,
+            default_notes=default_notes,
+        )
+        or _parse_milestone(
+            clause,
+            timezone_name,
+            client_now,
+            default_timestamp=default_timestamp,
+            default_notes=default_notes,
+        )
+    )
+    if action:
+        return DeterministicParseResult(actions=[action], recognized_clause_count=1)
+    return DeterministicParseResult(recognized_clause_count=1)
+
+
+def _parse_feeding(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+    *,
+    default_timestamp: datetime | None = None,
+    default_notes: str | None = None,
+) -> ParsedVoiceAction | None:
     if not any(keyword in segment for keyword in ("feed", "fed", "bottle", "nursed", "breast")):
         return None
-    timestamp = _resolve_single_timestamp(segment, timezone_name, client_now)
+    timestamp = _resolve_single_timestamp(
+        segment,
+        timezone_name,
+        client_now,
+        default_timestamp=default_timestamp,
+    )
     feeding_type = "bottle"
     if "breast left" in segment or "left breast" in segment:
         feeding_type = "breast_left"
@@ -530,7 +680,7 @@ def _parse_feeding(segment: str, timezone_name: str, client_now: datetime) -> Pa
             "amount_ml": amount_ml,
             "duration_min": duration_min,
             "timestamp": timestamp,
-            "notes": notes,
+            "notes": notes or default_notes,
         },
         warnings=warnings,
     )
@@ -540,13 +690,21 @@ def _parse_diaper_actions(
     segment: str,
     timezone_name: str,
     client_now: datetime,
+    *,
+    default_timestamp: datetime | None = None,
+    default_notes: str | None = None,
 ) -> DeterministicParseResult:
     if not any(keyword in segment for keyword in ("diaper", "poop", "pooped", "wet", "pee")):
         return DeterministicParseResult()
 
-    timestamp = _resolve_single_timestamp(segment, timezone_name, client_now)
-    notes = _extract_notes(segment)
-    normalized_segment = _normalize_diaper_segment(_strip_notes_clause(segment))
+    timestamp = _resolve_single_timestamp(
+        segment,
+        timezone_name,
+        client_now,
+        default_timestamp=default_timestamp,
+    )
+    notes = _extract_notes(segment) or default_notes
+    normalized_segment = _normalize_diaper_segment(segment)
     matches = list(DIAPER_EVENT_PATTERN.finditer(normalized_segment))
 
     if matches:
@@ -652,11 +810,23 @@ def _is_ambiguous_diaper_phrase(segment: str) -> bool:
     )
 
 
-def _parse_sleep(segment: str, timezone_name: str, client_now: datetime) -> ParsedVoiceAction | None:
+def _parse_sleep(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+    *,
+    default_timestamp: datetime | None = None,
+    default_notes: str | None = None,
+) -> ParsedVoiceAction | None:
     if not any(keyword in segment for keyword in ("sleep", "slept", "nap", "napped", "asleep")):
         return None
 
-    start_time = _resolve_single_timestamp(segment, timezone_name, client_now)
+    start_time = _resolve_single_timestamp(
+        segment,
+        timezone_name,
+        client_now,
+        default_timestamp=default_timestamp,
+    )
     end_time = None
     duration_min = None
 
@@ -691,12 +861,19 @@ def _parse_sleep(segment: str, timezone_name: str, client_now: datetime) -> Pars
             "end_time": end_time,
             "duration_min": duration_min,
             "quality": quality,
-            "notes": _extract_notes(segment),
+            "notes": _extract_notes(segment) or default_notes,
         },
     )
 
 
-def _parse_mood(segment: str, timezone_name: str, client_now: datetime) -> ParsedVoiceAction | None:
+def _parse_mood(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+    *,
+    default_timestamp: datetime | None = None,
+    default_notes: str | None = None,
+) -> ParsedVoiceAction | None:
     if "mood" not in segment and not any(keyword in segment for keyword in MOOD_KEYWORDS):
         return None
     mood_value = next((value for keyword, value in MOOD_KEYWORDS.items() if keyword in segment), None)
@@ -704,8 +881,13 @@ def _parse_mood(segment: str, timezone_name: str, client_now: datetime) -> Parse
     payload = {
         "mood": mood_value,
         "energy": energy_value,
-        "timestamp": _resolve_single_timestamp(segment, timezone_name, client_now),
-        "notes": _extract_notes(segment),
+        "timestamp": _resolve_single_timestamp(
+            segment,
+            timezone_name,
+            client_now,
+            default_timestamp=default_timestamp,
+        ),
+        "notes": _extract_notes(segment) or default_notes,
     }
     return ParsedVoiceAction(
         log_type=VoiceLogType.mood,
@@ -714,7 +896,14 @@ def _parse_mood(segment: str, timezone_name: str, client_now: datetime) -> Parse
     )
 
 
-def _parse_recovery(segment: str, timezone_name: str, client_now: datetime) -> ParsedVoiceAction | None:
+def _parse_recovery(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+    *,
+    default_timestamp: datetime | None = None,
+    default_notes: str | None = None,
+) -> ParsedVoiceAction | None:
     if "recovery" not in segment and "postpartum" not in segment and "water" not in segment and not any(keyword in segment for keyword in RECOVERY_SYMPTOMS):
         return None
     mood_value = next((value for keyword, value in RECOVERY_MOOD_KEYWORDS.items() if keyword in segment), None)
@@ -729,20 +918,37 @@ def _parse_recovery(segment: str, timezone_name: str, client_now: datetime) -> P
         log_type=VoiceLogType.recovery,
         confidence=0.9 if mood_value and energy_value and water_intake is not None else 0.65,
         payload={
-            "timestamp": _resolve_single_timestamp(segment, timezone_name, client_now),
+            "timestamp": _resolve_single_timestamp(
+                segment,
+                timezone_name,
+                client_now,
+                default_timestamp=default_timestamp,
+            ),
             "mood": mood_value,
             "energy_level": energy_value,
             "water_intake_oz": water_intake,
             "symptoms": symptoms,
-            "notes": _extract_notes(segment),
+            "notes": _extract_notes(segment) or default_notes,
         },
     )
 
 
-def _parse_growth(segment: str, timezone_name: str, client_now: datetime) -> ParsedVoiceAction | None:
+def _parse_growth(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+    *,
+    default_timestamp: datetime | None = None,
+    default_notes: str | None = None,
+) -> ParsedVoiceAction | None:
     if not any(keyword in segment for keyword in ("weight", "weighed", "height", "head circumference", "head size", "growth")):
         return None
-    measurement_dt = _resolve_single_timestamp(segment, timezone_name, client_now)
+    measurement_dt = _resolve_single_timestamp(
+        segment,
+        timezone_name,
+        client_now,
+        default_timestamp=default_timestamp,
+    )
     weight_kg = None
     height_cm = None
     head_cm = None
@@ -786,13 +992,20 @@ def _parse_growth(segment: str, timezone_name: str, client_now: datetime) -> Par
             "weight_kg": weight_kg,
             "height_cm": height_cm,
             "head_circumference_cm": head_cm,
-            "notes": _extract_notes(segment),
+            "notes": _extract_notes(segment) or default_notes,
         },
         warnings=warnings,
     )
 
 
-def _parse_milestone(segment: str, timezone_name: str, client_now: datetime) -> ParsedVoiceAction | None:
+def _parse_milestone(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+    *,
+    default_timestamp: datetime | None = None,
+    default_notes: str | None = None,
+) -> ParsedVoiceAction | None:
     milestone_keywords = ("milestone", "rolled over", "first steps", "smiled", "laughed", "crawled", "sat up")
     if not any(keyword in segment for keyword in milestone_keywords):
         return None
@@ -806,7 +1019,12 @@ def _parse_milestone(segment: str, timezone_name: str, client_now: datetime) -> 
         category = MilestoneCategory.language
 
     title = _extract_milestone_title(segment)
-    achieved_dt = _resolve_single_timestamp(segment, timezone_name, client_now)
+    achieved_dt = _resolve_single_timestamp(
+        segment,
+        timezone_name,
+        client_now,
+        default_timestamp=default_timestamp,
+    )
     return ParsedVoiceAction(
         log_type=VoiceLogType.milestone,
         confidence=0.88 if title else 0.62,
@@ -814,7 +1032,7 @@ def _parse_milestone(segment: str, timezone_name: str, client_now: datetime) -> 
             "title": title,
             "category": category,
             "achieved_date": achieved_dt.date(),
-            "notes": _extract_notes(segment),
+            "notes": _extract_notes(segment) or default_notes,
             "photo_url": None,
         },
     )
@@ -834,9 +1052,181 @@ def _extract_notes(segment: str) -> str | None:
     return None
 
 
-def _resolve_single_timestamp(segment: str, timezone_name: str, client_now: datetime) -> datetime:
-    parsed = _parse_time_expression(segment, timezone_name, client_now, segment)
-    return parsed or client_now.astimezone(ZoneInfo(timezone_name)).astimezone(timezone.utc)
+def _resolve_single_timestamp(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+    *,
+    default_timestamp: datetime | None = None,
+) -> datetime:
+    parsed = _resolve_explicit_timestamp(segment, timezone_name, client_now)
+    if parsed:
+        return parsed
+    if default_timestamp:
+        return default_timestamp
+    return client_now.astimezone(ZoneInfo(timezone_name)).astimezone(timezone.utc)
+
+
+def _resolve_explicit_timestamp(
+    segment: str,
+    timezone_name: str,
+    client_now: datetime,
+) -> datetime | None:
+    if _count_explicit_time_mentions(segment) == 0:
+        return None
+    return _parse_time_expression(segment, timezone_name, client_now, segment)
+
+
+def _resolve_shared_segment_timestamp(
+    segment: str,
+    clauses: list[str],
+    timezone_name: str,
+    client_now: datetime,
+) -> datetime | None:
+    if len(clauses) < 2 or _count_explicit_time_mentions(segment) != 1:
+        return None
+    return _resolve_explicit_timestamp(segment, timezone_name, client_now)
+
+
+def _count_explicit_time_mentions(segment: str) -> int:
+    return len(_explicit_time_spans(segment))
+
+
+def _explicit_time_spans(segment: str) -> list[tuple[int, int]]:
+    lowered = segment.lower()
+    spans: list[tuple[int, int]] = []
+    patterns = (
+        RELATIVE_DATE_PATTERN,
+        PART_OF_DAY_PATTERN,
+        ISO_DATE_PATTERN,
+        SLASH_DATE_PATTERN,
+        MONTH_NAME_PATTERN,
+        TIME_AMPM_PATTERN,
+        TIME_CONTEXTUAL_PATTERN,
+    )
+    for pattern in patterns:
+        spans.extend(match.span() for match in pattern.finditer(lowered))
+
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if not merged:
+            merged.append((start, end))
+            continue
+
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+            continue
+
+        gap = lowered[last_end:start]
+        if re.fullmatch(r"\s*(?:at|around|about|on)?\s*", gap):
+            merged[-1] = (last_start, end)
+            continue
+
+        merged.append((start, end))
+    return merged
+
+
+def _starts_new_event_clause(segment: str) -> bool:
+    candidate = SUBJECT_PREFIX_PATTERN.sub("", segment.strip(" ,."))
+    return any(
+        checker(candidate)
+        for checker in (
+            _looks_like_feeding_start,
+            _looks_like_diaper_start,
+            _looks_like_sleep_start,
+            _looks_like_mood_start,
+            _looks_like_recovery_start,
+            _looks_like_growth_start,
+            _looks_like_milestone_start,
+        )
+    )
+
+
+def _is_same_event_connector(left: str, right: str) -> bool:
+    return bool(
+        re.search(r"\b(wet|dirty|dry)$", left)
+        and re.match(r"(?:wet|dirty|dry)\s+diapers?\b", right)
+    )
+
+
+def _looks_like_feeding_start(segment: str) -> bool:
+    return bool(
+        re.match(
+            r"(?:fed|feed|feeding|bottle|nursed|nursing|breastfed|left breast|right breast|both breasts|both sides)\b",
+            segment,
+        )
+    )
+
+
+def _looks_like_diaper_start(segment: str) -> bool:
+    normalized = _normalize_diaper_segment(segment)
+    return bool(
+        DIAPER_EVENT_PATTERN.match(normalized)
+        or re.match(r"(?:diaper|diapers)\b", normalized)
+    )
+
+
+def _looks_like_sleep_start(segment: str) -> bool:
+    return bool(re.match(r"(?:sleep|slept|nap|napped|asleep)\b", segment))
+
+
+def _looks_like_mood_start(segment: str) -> bool:
+    return bool(re.match(r"mood\b", segment))
+
+
+def _looks_like_recovery_start(segment: str) -> bool:
+    return bool(re.match(r"(?:recovery|postpartum)\b", segment))
+
+
+def _looks_like_growth_start(segment: str) -> bool:
+    return bool(re.match(r"(?:weight|weighed|height|head circumference|head size|growth)\b", segment))
+
+
+def _looks_like_milestone_start(segment: str) -> bool:
+    return bool(re.match(r"(?:milestone|rolled over|first steps|smiled|laughed|crawled|sat up)\b", segment))
+
+
+def _choose_ambiguous_hour_datetime(
+    base_date: date,
+    hour: int,
+    minute: int,
+    zone: ZoneInfo,
+    local_now: datetime,
+) -> datetime:
+    candidates = [datetime.combine(base_date, time(hour=hour % 24, minute=minute), tzinfo=zone)]
+    if 1 <= hour <= 11:
+        candidates.append(datetime.combine(base_date, time(hour=hour + 12, minute=minute), tzinfo=zone))
+
+    past_candidates = [candidate for candidate in candidates if candidate <= local_now]
+    if past_candidates:
+        return max(past_candidates)
+    return min(candidates)
+
+
+def _resolve_base_date(local_now: datetime, time_text: str, full_segment: str) -> date:
+    lowered_sources = (time_text.lower(), full_segment.lower())
+    base_date = local_now.date()
+
+    if any("yesterday" in source for source in lowered_sources):
+        base_date = base_date - timedelta(days=1)
+    elif any("tomorrow" in source for source in lowered_sources):
+        base_date = base_date + timedelta(days=1)
+
+    for source in lowered_sources:
+        explicit_date_match = ISO_DATE_PATTERN.search(source)
+        if explicit_date_match:
+            try:
+                return date.fromisoformat(explicit_date_match.group(0))
+            except ValueError:
+                break
+
+    return base_date
+
+
+def _has_parseable_named_or_slash_date(text: str) -> bool:
+    return bool(MONTH_NAME_PATTERN.search(text) or SLASH_DATE_PATTERN.search(text))
 
 
 def _parse_time_expression(
@@ -847,26 +1237,15 @@ def _parse_time_expression(
 ) -> datetime | None:
     zone = ZoneInfo(timezone_name)
     local_now = client_now.astimezone(zone)
-    base_date = local_now.date()
-
     lowered = time_text.lower()
-    if "yesterday" in lowered:
-        base_date = base_date - timedelta(days=1)
-    elif "tomorrow" in lowered:
-        base_date = base_date + timedelta(days=1)
-
-    explicit_date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", lowered)
-    if explicit_date_match:
-        try:
-            base_date = date.fromisoformat(explicit_date_match.group(1))
-        except ValueError:
-            pass
+    full_lowered = full_segment.lower()
+    base_date = _resolve_base_date(local_now, time_text, full_segment)
 
     for label, default_time in RELATIVE_TIME_DEFAULTS.items():
-        if label in lowered:
+        if label in lowered or (time_text == full_segment and label in full_lowered):
             return datetime.combine(base_date, default_time, tzinfo=zone).astimezone(timezone.utc)
 
-    time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", lowered)
+    time_match = TIME_AMPM_PATTERN.search(lowered)
     if time_match:
         hour = int(time_match.group(1))
         minute = int(time_match.group(2) or 0)
@@ -877,8 +1256,18 @@ def _parse_time_expression(
             hour = 0
         return datetime.combine(base_date, time(hour=hour, minute=minute), tzinfo=zone).astimezone(timezone.utc)
 
-    if any(keyword in full_segment for keyword in ("today", "yesterday", "tomorrow")):
+    contextual_time_match = TIME_CONTEXTUAL_PATTERN.search(lowered)
+    if contextual_time_match:
+        hour = int(contextual_time_match.group(1))
+        minute = int(contextual_time_match.group(2) or 0)
+        chosen = _choose_ambiguous_hour_datetime(base_date, hour, minute, zone, local_now)
+        return chosen.astimezone(timezone.utc)
+
+    if any(keyword in full_lowered for keyword in ("today", "yesterday", "tomorrow")) or ISO_DATE_PATTERN.search(full_lowered):
         return datetime.combine(base_date, local_now.timetz().replace(tzinfo=None), tzinfo=zone).astimezone(timezone.utc)
+
+    if not _has_parseable_named_or_slash_date(lowered):
+        return None
 
     try:
         parsed = date_parser.parse(time_text, fuzzy=True, default=local_now.replace(tzinfo=None))

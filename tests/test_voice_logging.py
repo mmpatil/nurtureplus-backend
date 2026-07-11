@@ -176,6 +176,61 @@ def test_analyze_voice_transcript_expands_diapers_with_shared_timestamp():
     ]
 
 
+def test_analyze_voice_transcript_preserves_distinct_timestamps_for_repeated_diapers():
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="baby has one wet diaper at 7:30am and second wet diaper at 8:30am",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 18, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "created"
+    assert [action.payload["diaper_type"] for action in result.actions] == ["wet", "wet"]
+    assert [action.validated_payload.timestamp.isoformat() for action in result.actions] == [
+        "2026-06-07T14:30:00+00:00",
+        "2026-06-07T15:30:00+00:00",
+    ]
+
+
+def test_analyze_voice_transcript_splits_repeated_feeding_actions_joined_by_and():
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="fed 120 ml at 7:30am and fed 150 ml at 8:30am",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 18, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "created"
+    assert [action.log_type for action in result.actions] == [VoiceLogType.feeding, VoiceLogType.feeding]
+    assert [action.payload["amount_ml"] for action in result.actions] == [120, 150]
+    assert [action.validated_payload.timestamp.isoformat() for action in result.actions] == [
+        "2026-06-07T14:30:00+00:00",
+        "2026-06-07T15:30:00+00:00",
+    ]
+
+
+def test_analyze_voice_transcript_splits_mixed_actions_joined_by_plain_and():
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="fed 120 ml at 7:30am and wet diaper at 8:30am",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 18, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "created"
+    assert [action.log_type for action in result.actions] == [VoiceLogType.feeding, VoiceLogType.diaper]
+    assert [action.validated_payload.timestamp.isoformat() for action in result.actions] == [
+        "2026-06-07T14:30:00+00:00",
+        "2026-06-07T15:30:00+00:00",
+    ]
+
+
 def test_analyze_voice_transcript_returns_confirmation_for_ambiguous_diapers():
     result = _run(
         voice_logging.analyze_voice_transcript(
@@ -202,6 +257,25 @@ def test_analyze_voice_transcript_parses_simple_sleep():
 
     assert result.actions[0].log_type == VoiceLogType.sleep
     assert result.actions[0].payload["duration_min"] == 120
+
+
+def test_analyze_voice_transcript_splits_repeated_sleep_actions_joined_by_and():
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="nap from 7:30am to 8:30am and nap from 10am to 11am",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 18, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "created"
+    assert [action.log_type for action in result.actions] == [VoiceLogType.sleep, VoiceLogType.sleep]
+    assert [action.payload["duration_min"] for action in result.actions] == [60, 60]
+    assert [action.validated_payload.start_time.isoformat() for action in result.actions] == [
+        "2026-06-07T14:30:00+00:00",
+        "2026-06-07T17:00:00+00:00",
+    ]
 
 
 def test_relative_time_resolution_uses_client_timezone():
@@ -336,6 +410,59 @@ def test_llm_fallback_high_confidence_autosaves(monkeypatch):
     )
 
     assert result.status == "created"
+
+
+def test_llm_fallback_runs_when_deterministic_parser_under_materializes_recognized_clauses(monkeypatch):
+    deterministic_action = voice_logging.ParsedVoiceAction(
+        log_type=VoiceLogType.feeding,
+        confidence=0.95,
+        payload={
+            "feeding_type": "bottle",
+            "amount_ml": 120,
+            "timestamp": datetime(2026, 6, 7, 14, 30, tzinfo=timezone.utc),
+        },
+    )
+    llm_actions = [
+        voice_logging.ParsedVoiceAction(
+            log_type=VoiceLogType.feeding,
+            confidence=0.95,
+            payload={
+                "feeding_type": "bottle",
+                "amount_ml": 120,
+                "timestamp": datetime(2026, 6, 7, 14, 30, tzinfo=timezone.utc),
+            },
+        ),
+        voice_logging.ParsedVoiceAction(
+            log_type=VoiceLogType.diaper,
+            confidence=0.95,
+            payload={
+                "diaper_type": "wet",
+                "timestamp": datetime(2026, 6, 7, 15, 30, tzinfo=timezone.utc),
+            },
+        ),
+    ]
+
+    monkeypatch.setattr(
+        voice_logging,
+        "_parse_deterministic_actions",
+        lambda *_args, **_kwargs: voice_logging.DeterministicParseResult(
+            actions=[deterministic_action],
+            recognized_clause_count=2,
+        ),
+    )
+    monkeypatch.setattr(voice_logging, "_extract_with_llm", _async_return(llm_actions))
+
+    result = _run(
+        voice_logging.analyze_voice_transcript(
+            transcript="fed 120 ml at 7:30am and wet diaper at 8:30am",
+            baby_id=uuid4(),
+            timezone_name="America/Los_Angeles",
+            client_now=datetime(2026, 6, 7, 18, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status == "created"
+    assert [action.log_type for action in result.actions] == [VoiceLogType.feeding, VoiceLogType.diaper]
 
 
 def test_llm_fallback_low_confidence_needs_confirmation(monkeypatch):
@@ -703,6 +830,76 @@ def test_route_autosaves_expanded_diaper_actions_in_order(client, monkeypatch):
     payload = response.json()
     assert payload["status"] == "created"
     assert [item["resource"]["diaper_type"] for item in payload["created_actions"]] == ["wet", "wet", "dirty"]
+
+
+def test_route_autosaves_plain_and_compound_actions_in_order(client, monkeypatch):
+    from app.api import routes
+
+    user = _make_user()
+    fake_db = FakeDB()
+    baby_id = uuid4()
+    now = datetime(2026, 6, 7, 18, 0, tzinfo=timezone.utc)
+
+    async def fake_create_voice_logs(**kwargs):
+        actions = kwargs["actions"]
+        assert [action.log_type for action in actions] == [VoiceLogType.feeding, VoiceLogType.diaper]
+        assert [action.validated_payload.timestamp.isoformat() for action in actions] == [
+            "2026-06-07T14:30:00+00:00",
+            "2026-06-07T15:30:00+00:00",
+        ]
+
+        feeding_resource = SimpleNamespace(
+            id=uuid4(),
+            baby_id=baby_id,
+            feeding_type="bottle",
+            amount_ml=actions[0].validated_payload.amount_ml,
+            duration_min=actions[0].validated_payload.duration_min,
+            timestamp=actions[0].validated_payload.timestamp,
+            notes=actions[0].validated_payload.notes,
+            created_by_user_id=user.id,
+            updated_by_user_id=user.id,
+            created_at=now,
+            updated_at=now,
+        )
+        diaper_resource = SimpleNamespace(
+            id=uuid4(),
+            baby_id=baby_id,
+            diaper_type=actions[1].validated_payload.diaper_type,
+            timestamp=actions[1].validated_payload.timestamp,
+            notes=actions[1].validated_payload.notes,
+            created_by_user_id=user.id,
+            updated_by_user_id=user.id,
+            created_at=now,
+            updated_at=now,
+        )
+        return [
+            voice_logging.CreatedVoiceAction(log_type=VoiceLogType.feeding, confidence=actions[0].confidence, resource=feeding_resource),
+            voice_logging.CreatedVoiceAction(log_type=VoiceLogType.diaper, confidence=actions[1].confidence, resource=diaper_resource),
+        ]
+
+    async def fake_require_baby_edit_permission(*_args, **_kwargs):
+        return None
+
+    app.dependency_overrides[get_current_user] = _override_user(user)
+    app.dependency_overrides[get_db] = _override_db(fake_db)
+    monkeypatch.setattr(routes.voice_logging_crud, "create_voice_logs", fake_create_voice_logs)
+    monkeypatch.setattr(routes, "require_baby_edit_permission", fake_require_baby_edit_permission)
+    monkeypatch.setattr(routes, "_serialize_entry_with_audit", _stub_serialize_entry_with_audit)
+
+    response = client.post(
+        "/voice/logs",
+        json={
+            "transcript": "fed 120 ml at 7:30am and wet diaper at 8:30am",
+            "baby_id": str(baby_id),
+            "timezone": "America/Los_Angeles",
+            "client_now": now.isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "created"
+    assert [item["log_type"] for item in payload["created_actions"]] == ["feeding", "diaper"]
 
 
 def test_route_returns_needs_confirmation_without_saving(client, monkeypatch):
