@@ -36,6 +36,9 @@ class ProductAnalysis(Base):
     parsed_facts: dict = Column(JSON, nullable=True)
     status: str = Column(String(30), nullable=True)
     confidence: float = Column(Float, nullable=True)
+    lookup_status: str = Column(String(30), nullable=True)
+    category_guess: str = Column(String(100), nullable=True)
+    analysis_sources: list[dict] = Column(JSON, nullable=True)
     model_name: str = Column(String(100), nullable=True)
     raw_payload: dict = Column(JSON, nullable=True)
     created_at: datetime = Column(
@@ -53,4 +56,3 @@ class ProductAnalysis(Base):
     __table_args__ = (
         Index("ix_product_analyses_user_id_created_at", "user_id", "created_at"),
     )
-

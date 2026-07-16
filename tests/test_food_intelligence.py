@@ -27,7 +27,12 @@ from app.schemas.feeding import (
     SuggestedFeedingPayload,
 )
 from app.schemas.food_profile import BabyFoodProfileResponse
-from app.schemas.product_analysis import ProductAnalysisResponse, ProductSuitabilityRow
+from app.schemas.product_analysis import (
+    ProductAnalysisResponse,
+    ProductAnalysisSource,
+    ProductConcern,
+    ProductSuitabilityRow,
+)
 
 
 def _make_user() -> User:
@@ -39,10 +44,24 @@ def _make_user() -> User:
 class FakeDB:
     def __init__(self, results: list[object] | None = None):
         self._results = list(results or [])
+        self.added: list[object] = []
 
     async def execute(self, _statement):
         scalar = self._results.pop(0) if self._results else None
         return SimpleNamespace(scalar_one_or_none=lambda: scalar)
+
+    def add(self, obj):
+        if getattr(obj, "id", None) is None:
+            obj.id = uuid4()
+        now = datetime.now(timezone.utc)
+        if getattr(obj, "created_at", None) is None:
+            obj.created_at = now
+        if getattr(obj, "updated_at", None) is None:
+            obj.updated_at = now
+        self.added.append(obj)
+
+    async def flush(self):
+        return None
 
     async def commit(self):
         return None
@@ -215,9 +234,13 @@ def test_product_assessment_flags_honey_and_allergen_conflicts():
             "ingredients": ["milk", "honey", "banana"],
         },
         request,
+        confidence=0.9,
+        category_guess="snack",
     )
 
-    assert row.verdict == "bad"
+    assert row.verdict == "very_bad"
+    assert row.ingredient_concerns
+    assert row.category_concerns
     assert "milk" in row.allergen_hits
     assert "honey" in row.warning_flags
 
@@ -576,6 +599,16 @@ def test_product_analysis_route_returns_multi_child_matrix(client, monkeypatch):
             status="completed",
             confidence=0.91,
             parsed_facts={"added_sugar_g": 4},
+            lookup_status="fetched",
+            category_guess="snack",
+            analysis_sources=[
+                ProductAnalysisSource(
+                    url="https://brand.example/snack",
+                    domain="brand.example",
+                    source_kind="brand",
+                    used_fields=["product_name", "ingredients"],
+                )
+            ],
             package_front_url="https://example.com/front.jpg",
             package_back_url="https://example.com/back.jpg",
             ingredients_text="banana, milk",
@@ -586,7 +619,17 @@ def test_product_analysis_route_returns_multi_child_matrix(client, monkeypatch):
                     baby_name="Ava",
                     life_stage="6-11 months",
                     verdict="bad",
+                    headline="Bad fit because this snack has added sugar.",
                     confidence=0.91,
+                    ingredient_concerns=[
+                        ProductConcern(
+                            code="added_sugar",
+                            label="Added Sugar",
+                            severity="medium",
+                            message="This product contains a meaningful amount of added sugar.",
+                        )
+                    ],
+                    category_concerns=[],
                     reasons=["Added sugar is not ideal for babies under 12 months."],
                     warning_flags=["added_sugar"],
                     allergen_hits=[],
@@ -595,8 +638,18 @@ def test_product_analysis_route_returns_multi_child_matrix(client, monkeypatch):
                     baby_id=uuid4(),
                     baby_name="Leo",
                     life_stage="12-35 months",
-                    verdict="okay",
+                    verdict="average",
+                    headline="Average fit. Some caution is needed for added sugar.",
                     confidence=0.91,
+                    ingredient_concerns=[],
+                    category_concerns=[
+                        ProductConcern(
+                            code="sweet_treat",
+                            label="Sweet Treat",
+                            severity="medium",
+                            message="This looks like a sweet snack or dessert-style product for this age group.",
+                        )
+                    ],
                     reasons=["Moderate added sugar."],
                     warning_flags=["added_sugar"],
                     allergen_hits=[],
@@ -622,7 +675,285 @@ def test_product_analysis_route_returns_multi_child_matrix(client, monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert len(payload["suitability"]) == 2
-    assert {row["verdict"] for row in payload["suitability"]} == {"bad", "okay"}
+    assert payload["lookup_status"] == "fetched"
+    assert payload["analysis_sources"][0]["source_kind"] == "brand"
+    assert {row["verdict"] for row in payload["suitability"]} == {"bad", "average"}
+
+
+def test_product_analysis_falls_back_to_voice_model_when_food_model_unset(monkeypatch):
+    fake_db = FakeDB()
+    baby_id = uuid4()
+    captured: dict[str, str] = {}
+
+    async def fake_accessible_babies(*_args, **_kwargs):
+        return [SimpleNamespace(id=baby_id, name="Ava", birth_date=date(2025, 7, 1))]
+
+    async def fake_profile_map(*_args, **_kwargs):
+        return {}
+
+    async def fake_extract(self, _body):
+        captured["model"] = self.model
+        return {"product_name": "Resolved Snack", "ingredients": ["banana"]}
+
+    async def fake_lookup(*_args, **_kwargs):
+        return food_intelligence.ProductWebsiteLookupResult(
+            parsed_facts={},
+            lookup_status="not_attempted",
+            category_guess=None,
+            analysis_sources=[],
+        )
+
+    monkeypatch.setattr(food_intelligence, "_get_accessible_babies", fake_accessible_babies)
+    monkeypatch.setattr(food_intelligence, "_get_profile_map", fake_profile_map)
+    monkeypatch.setattr(food_intelligence, "_lookup_product_website_data", fake_lookup)
+    monkeypatch.setattr(food_intelligence.OpenAIFoodExtractor, "extract_product_facts", fake_extract)
+    monkeypatch.setattr(food_intelligence.settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(food_intelligence.settings, "voice_llm_model", "gpt-4o-mini")
+    monkeypatch.setattr(food_intelligence.settings, "food_ai_model", None)
+
+    response = asyncio.run(
+        food_intelligence.analyze_product(
+            fake_db,
+            uuid4(),
+            food_intelligence.ProductAnalysisRequest(ingredients_text="banana"),
+        )
+    )
+
+    assert response.status == "completed"
+    assert response.product_name == "Resolved Snack"
+    assert captured["model"] == "gpt-4o-mini"
+
+
+def test_product_analysis_persists_resolved_food_model_name(monkeypatch):
+    fake_db = FakeDB()
+    baby_id = uuid4()
+
+    async def fake_accessible_babies(*_args, **_kwargs):
+        return [SimpleNamespace(id=baby_id, name="Leo", birth_date=date(2024, 7, 1))]
+
+    async def fake_profile_map(*_args, **_kwargs):
+        return {}
+
+    async def fake_extract(self, _body):
+        return {"brand_name": "Brand", "ingredients": ["oats"]}
+
+    async def fake_lookup(*_args, **_kwargs):
+        return food_intelligence.ProductWebsiteLookupResult(
+            parsed_facts={},
+            lookup_status="not_attempted",
+            category_guess="meal",
+            analysis_sources=[],
+        )
+
+    monkeypatch.setattr(food_intelligence, "_get_accessible_babies", fake_accessible_babies)
+    monkeypatch.setattr(food_intelligence, "_get_profile_map", fake_profile_map)
+    monkeypatch.setattr(food_intelligence, "_lookup_product_website_data", fake_lookup)
+    monkeypatch.setattr(food_intelligence.OpenAIFoodExtractor, "extract_product_facts", fake_extract)
+    monkeypatch.setattr(food_intelligence.settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(food_intelligence.settings, "voice_llm_model", "gpt-4o-mini")
+    monkeypatch.setattr(food_intelligence.settings, "food_ai_model", "gpt-4.1-mini")
+
+    response = asyncio.run(
+        food_intelligence.analyze_product(
+            fake_db,
+            uuid4(),
+            food_intelligence.ProductAnalysisRequest(ingredients_text="oats"),
+        )
+    )
+
+    analysis = next(obj for obj in fake_db.added if obj.__class__.__name__ == "ProductAnalysis")
+
+    assert response.brand_name == "Brand"
+    assert analysis.model_name == "gpt-4.1-mini"
+    assert analysis.category_guess == "meal"
+
+
+def test_product_analysis_route_returns_200_with_openai_enabled(client, monkeypatch):
+    user = _make_user()
+    fake_db = FakeDB()
+    baby_id = uuid4()
+
+    async def fake_accessible_babies(*_args, **_kwargs):
+        return [SimpleNamespace(id=baby_id, name="Mila", birth_date=date(2025, 1, 1))]
+
+    async def fake_profile_map(*_args, **_kwargs):
+        return {}
+
+    async def fake_extract(self, _body):
+        return {"product_name": "Banana Bites", "ingredients": ["banana"]}
+
+    async def fake_lookup(*_args, **_kwargs):
+        return food_intelligence.ProductWebsiteLookupResult(
+            parsed_facts={},
+            lookup_status="not_attempted",
+            category_guess="puree",
+            analysis_sources=[],
+        )
+
+    app.dependency_overrides[get_current_user] = _override_user(user)
+    app.dependency_overrides[get_db] = _override_db(fake_db)
+    monkeypatch.setattr(food_intelligence, "_get_accessible_babies", fake_accessible_babies)
+    monkeypatch.setattr(food_intelligence, "_get_profile_map", fake_profile_map)
+    monkeypatch.setattr(food_intelligence, "_lookup_product_website_data", fake_lookup)
+    monkeypatch.setattr(food_intelligence.OpenAIFoodExtractor, "extract_product_facts", fake_extract)
+    monkeypatch.setattr(food_intelligence.settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(food_intelligence.settings, "voice_llm_model", "gpt-4o-mini")
+    monkeypatch.setattr(food_intelligence.settings, "food_ai_model", None)
+
+    response = client.post(
+        "/food-products/analyze",
+        json={
+            "ingredients_text": "banana",
+            "nutrition_facts_text": "Calories 45",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["product_name"] == "Banana Bites"
+
+
+def test_lookup_failure_returns_200_and_failed_status(client, monkeypatch):
+    user = _make_user()
+    fake_db = FakeDB()
+    baby_id = uuid4()
+
+    async def fake_accessible_babies(*_args, **_kwargs):
+        return [SimpleNamespace(id=baby_id, name="Kai", birth_date=date(2025, 1, 1))]
+
+    async def fake_profile_map(*_args, **_kwargs):
+        return {}
+
+    async def fake_lookup(*_args, **_kwargs):
+        return food_intelligence.ProductWebsiteLookupResult(
+            parsed_facts={},
+            lookup_status="failed",
+            category_guess=None,
+            analysis_sources=[],
+        )
+
+    app.dependency_overrides[get_current_user] = _override_user(user)
+    app.dependency_overrides[get_db] = _override_db(fake_db)
+    monkeypatch.setattr(food_intelligence, "_get_accessible_babies", fake_accessible_babies)
+    monkeypatch.setattr(food_intelligence, "_get_profile_map", fake_profile_map)
+    monkeypatch.setattr(food_intelligence, "_lookup_product_website_data", fake_lookup)
+    monkeypatch.setattr(food_intelligence.settings, "openai_api_key", None)
+
+    response = client.post(
+        "/food-products/analyze",
+        json={
+            "product_name": "Fruit Bites",
+            "ingredients_text": "banana",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["lookup_status"] == "failed"
+
+
+def test_rank_product_candidates_prefers_brand_over_retailer():
+    body = food_intelligence.ProductAnalysisRequest(product_name="Acme Toddler Oat Bar", brand_name="Acme")
+    ranked = food_intelligence._rank_product_candidates(
+        [
+            {"link": "https://www.target.com/p/acme-oat-bar", "title": "Acme Oat Bar at Target"},
+            {"link": "https://www.acmefoods.com/products/oat-bar", "title": "Acme Oat Bar"},
+        ],
+        body,
+    )
+
+    assert ranked[0]["source_kind"] == "brand"
+    assert ranked[1]["source_kind"] == "retailer"
+
+
+def test_website_data_only_fills_missing_fields():
+    merged, used_fields = food_intelligence._merge_parsed_facts(
+        {"ingredients": ["banana"], "calories": 45},
+        {"ingredients": ["banana", "milk"], "calories": 80, "sodium_mg": 60},
+    )
+
+    assert merged["ingredients"] == ["banana"]
+    assert merged["calories"] == 45
+    assert merged["sodium_mg"] == 60
+    assert used_fields == ["sodium_mg"]
+
+
+def test_clean_product_can_score_excellent():
+    baby = SimpleNamespace(id=uuid4(), name="Mira", birth_date=date(2025, 1, 1))
+    request = SimpleNamespace(
+        product_name="Iron Oatmeal",
+        brand_name="Test Brand",
+        ingredients_text="oats, banana",
+        nutrition_facts_text="Protein 4g Fiber 2g Iron 2mg Added Sugars 0g",
+        manual_nutrition=None,
+    )
+
+    row = food_intelligence._assess_product_for_baby(
+        baby,
+        None,
+        {
+            "ingredients": ["oats", "banana"],
+            "protein_g": 4,
+            "fiber_g": 2,
+            "iron_mg": 2,
+            "added_sugar_g": 0,
+            "calories": 90,
+        },
+        request,
+        confidence=0.9,
+        category_guess="meal",
+    )
+
+    assert row.verdict == "excellent"
+    assert row.headline
+    assert not row.ingredient_concerns
+
+
+def test_saved_analysis_persists_new_product_metadata(monkeypatch):
+    fake_db = FakeDB()
+    baby_id = uuid4()
+
+    async def fake_accessible_babies(*_args, **_kwargs):
+        return [SimpleNamespace(id=baby_id, name="Lia", birth_date=date(2025, 1, 1))]
+
+    async def fake_profile_map(*_args, **_kwargs):
+        return {}
+
+    async def fake_lookup(*_args, **_kwargs):
+        return food_intelligence.ProductWebsiteLookupResult(
+            parsed_facts={"ingredients": ["banana"], "sodium_mg": 45},
+            lookup_status="fetched",
+            category_guess="snack",
+            analysis_sources=[
+                ProductAnalysisSource(
+                    url="https://brand.example/banana-bites",
+                    domain="brand.example",
+                    source_kind="brand",
+                    used_fields=["ingredients", "sodium_mg", "category_guess"],
+                )
+            ],
+        )
+
+    monkeypatch.setattr(food_intelligence, "_get_accessible_babies", fake_accessible_babies)
+    monkeypatch.setattr(food_intelligence, "_get_profile_map", fake_profile_map)
+    monkeypatch.setattr(food_intelligence, "_lookup_product_website_data", fake_lookup)
+    monkeypatch.setattr(food_intelligence.settings, "openai_api_key", None)
+
+    response = asyncio.run(
+        food_intelligence.analyze_product(
+            fake_db,
+            uuid4(),
+            food_intelligence.ProductAnalysisRequest(product_name="Banana Bites"),
+        )
+    )
+
+    analysis = next(obj for obj in fake_db.added if obj.__class__.__name__ == "ProductAnalysis")
+    suitability = next(obj for obj in fake_db.added if obj.__class__.__name__ == "ProductSuitabilityAssessment")
+
+    assert response.lookup_status == "fetched"
+    assert analysis.lookup_status == "fetched"
+    assert analysis.analysis_sources
+    assert suitability.headline
+    assert suitability.ingredient_concerns is not None
+    assert suitability.category_concerns is not None
 
 
 def test_account_deletion_collects_product_analysis_urls(monkeypatch):

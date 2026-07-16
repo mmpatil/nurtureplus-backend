@@ -22,10 +22,15 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
-    # Voice logging
+    # AI-assisted analysis
     openai_api_key: Optional[str] = None
     voice_llm_model: str = "gpt-4o-mini"
+    food_ai_model: Optional[str] = None
+    food_ai_autosave_threshold: float = 0.85
     voice_autosave_threshold: float = 0.85
+    serpapi_api_key: Optional[str] = None
+    website_lookup_timeout_seconds: float = 5.0
+    website_lookup_enabled: bool = True
     
     # App
     app_title: str = "Nurture+ API"
@@ -42,6 +47,11 @@ class Settings(BaseSettings):
     def allowed_origins_list(self) -> list[str]:
         """Return allowed origins as a list."""
         return [origin.strip() for origin in self.allowed_origins.split(",")]
+
+    @property
+    def resolved_food_ai_model(self) -> str:
+        """Return the configured food model, falling back to the shared voice model."""
+        return self.food_ai_model or self.voice_llm_model
 
 
 settings = Settings()

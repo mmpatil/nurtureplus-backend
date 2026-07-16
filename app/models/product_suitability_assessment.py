@@ -34,8 +34,11 @@ class ProductSuitabilityAssessment(Base):
         index=True,
     )
     life_stage: str = Column(String(30), nullable=False)
-    verdict: str = Column(String(10), nullable=False)
+    verdict: str = Column(String(20), nullable=False)
+    headline: str = Column(String(255), nullable=True)
     confidence: float = Column(Float, nullable=True)
+    ingredient_concerns: list[dict] = Column(JSON, nullable=False, default=list)
+    category_concerns: list[dict] = Column(JSON, nullable=False, default=list)
     reasons: list[str] = Column(JSON, nullable=False, default=list)
     warning_flags: list[str] = Column(JSON, nullable=False, default=list)
     allergen_hits: list[str] = Column(JSON, nullable=False, default=list)
