@@ -27,6 +27,17 @@ This matches the current iOS product-analysis upload behavior:
 - `users/{firebaseUid}/food-products/package_front_photo/...`
 - `users/{firebaseUid}/food-products/package_back_photo/...`
 
+Meal photos must also live under the user subtree:
+
+- `users/{firebaseUid}/feedings/{draftOrFeedingId}/meal_before/{filename}`
+- `users/{firebaseUid}/feedings/{draftOrFeedingId}/meal_after/{filename}`
+
+Unsupported legacy path:
+
+- `feedings/...`
+
+The backend now rejects meal logging payloads that reference top-level `gs://.../feedings/...` objects or `gs://.../users/{otherUserId}/...` objects. Log Meal uploads should stay inside `users/{firebaseUid}/feedings/...`.
+
 ## Deploy
 
 From the repository root, deploy the live Storage rules with a Firebase-authenticated CLI user or service account that has Firebase Rules release permissions for `nurture-plus-deployment-ej0gq2`.

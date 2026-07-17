@@ -245,6 +245,44 @@ def test_product_assessment_flags_honey_and_allergen_conflicts():
     assert "honey" in row.warning_flags
 
 
+def test_validate_feeding_media_urls_accepts_same_user_gs_path():
+    food_intelligence.validate_feeding_media_urls(
+        [
+            FeedingMediaCreate(
+                media_role="meal_before",
+                media_url="gs://nurture-plus-deployment-ej0gq2.firebasestorage.app/users/dev_uid/feedings/draft-123/meal_before/photo.jpg",
+            )
+        ],
+        "dev_uid",
+    )
+
+
+def test_validate_feeding_media_urls_rejects_top_level_feedings_path():
+    with pytest.raises(ValueError, match=r"users/dev_uid/feedings/"):
+        food_intelligence.validate_feeding_media_urls(
+            [
+                FeedingMediaCreate(
+                    media_role="meal_before",
+                    media_url="gs://nurture-plus-deployment-ej0gq2.firebasestorage.app/feedings/draft-123/meal_before/photo.jpg",
+                )
+            ],
+            "dev_uid",
+        )
+
+
+def test_validate_feeding_media_urls_rejects_other_user_path():
+    with pytest.raises(ValueError, match=r"users/dev_uid/feedings/"):
+        food_intelligence.validate_feeding_media_urls(
+            [
+                FeedingMediaCreate(
+                    media_role="meal_before",
+                    media_url="gs://nurture-plus-deployment-ej0gq2.firebasestorage.app/users/other_uid/feedings/draft-123/meal_before/photo.jpg",
+                )
+            ],
+            "dev_uid",
+        )
+
+
 def test_legacy_feeding_create_response_remains_compatible(client, monkeypatch):
     from app.api import routes
 
@@ -295,6 +333,44 @@ def test_legacy_feeding_create_response_remains_compatible(client, monkeypatch):
     assert payload["notes"] == "fed well"
     assert payload["media"] == []
     assert payload["nutrition_estimate"] is None
+
+
+def test_create_feeding_route_rejects_legacy_feedings_storage_path(client, monkeypatch):
+    user = _make_user()
+    baby_id = uuid4()
+    state = {"create_called": False}
+
+    async def fake_require_baby_edit_permission(*_args, **_kwargs):
+        return None
+
+    async def fake_create_feeding_entry(*_args, **_kwargs):
+        state["create_called"] = True
+        return None
+
+    from app.api import routes
+
+    app.dependency_overrides[get_current_user] = _override_user(user)
+    app.dependency_overrides[get_db] = _override_db(FakeDB())
+    monkeypatch.setattr(routes, "require_baby_edit_permission", fake_require_baby_edit_permission)
+    monkeypatch.setattr(routes.feeding_crud, "create_feeding_entry", fake_create_feeding_entry)
+
+    response = client.post(
+        f"/babies/{baby_id}/feedings",
+        json={
+            "feeding_type": "bottle",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "media": [
+                {
+                    "media_role": "before_meal_photo",
+                    "media_url": "gs://nurture-plus-deployment-ej0gq2.firebasestorage.app/feedings/draft-123/meal_before/photo.jpg",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "users/" in response.json()["detail"]
+    assert state["create_called"] is False
 
 
 def test_feeding_options_route_returns_age_based_choices(client, monkeypatch):
@@ -583,6 +659,80 @@ def test_confirm_feeding_analysis_route_saves_reviewed_draft(client, monkeypatch
 
     assert response.status_code == 201
     assert response.json()["food_name"] == "banana mash"
+
+
+def test_analyze_feeding_route_rejects_legacy_feedings_storage_path(client, monkeypatch):
+    from app.api import routes
+
+    user = _make_user()
+    baby_id = uuid4()
+
+    async def fake_require_baby_edit_permission(*_args, **_kwargs):
+        return None
+
+    async def fake_analyze_feeding(*_args, **_kwargs):
+        raise AssertionError("analyze_feeding should not be called for invalid media paths")
+
+    app.dependency_overrides[get_current_user] = _override_user(user)
+    app.dependency_overrides[get_db] = _override_db(FakeDB())
+    monkeypatch.setattr(routes, "require_baby_edit_permission", fake_require_baby_edit_permission)
+    monkeypatch.setattr(routes.food_intelligence_crud, "analyze_feeding", fake_analyze_feeding)
+
+    response = client.post(
+        f"/babies/{baby_id}/feedings/analyze",
+        json={
+            "feeding": {
+                "feeding_type": "bottle",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "media": [
+                    {
+                        "media_role": "before_meal_photo",
+                        "media_url": "gs://nurture-plus-deployment-ej0gq2.firebasestorage.app/feedings/draft-123/meal_before/photo.jpg",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert "users/" in response.json()["detail"]
+
+
+def test_confirm_feeding_analysis_route_rejects_wrong_user_storage_path(client, monkeypatch):
+    from app.api import routes
+
+    user = _make_user()
+    baby_id = uuid4()
+
+    async def fake_require_baby_edit_permission(*_args, **_kwargs):
+        return None
+
+    async def fake_confirm(*_args, **_kwargs):
+        raise AssertionError("confirm_feeding_analysis should not be called for invalid media paths")
+
+    app.dependency_overrides[get_current_user] = _override_user(user)
+    app.dependency_overrides[get_db] = _override_db(FakeDB())
+    monkeypatch.setattr(routes, "require_baby_edit_permission", fake_require_baby_edit_permission)
+    monkeypatch.setattr(routes.food_intelligence_crud, "confirm_feeding_analysis", fake_confirm)
+
+    response = client.post(
+        f"/babies/{baby_id}/feedings/confirm",
+        json={
+            "feeding": {
+                "feeding_type": "bottle",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "media": [
+                    {
+                        "media_role": "before_meal_photo",
+                        "media_url": "gs://nurture-plus-deployment-ej0gq2.firebasestorage.app/users/other_uid/feedings/draft-123/meal_before/photo.jpg",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert f"users/{user.firebase_uid}/feedings/" in response.json()["detail"]
 
 
 def test_product_analysis_route_returns_multi_child_matrix(client, monkeypatch):

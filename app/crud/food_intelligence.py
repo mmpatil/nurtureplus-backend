@@ -185,6 +185,34 @@ def _title_case_words(value: str) -> str:
     return " ".join(word.capitalize() for word in value.split())
 
 
+def validate_feeding_media_urls(
+    media_items: list[FeedingMediaCreate] | None,
+    firebase_uid: str,
+) -> None:
+    """Validate supported feeding media URLs for the authenticated user."""
+    if not media_items:
+        return
+
+    expected_prefix = f"users/{firebase_uid}/feedings/"
+    for item in media_items:
+        media_url = item.media_url.strip()
+        parsed = urlparse(media_url)
+
+        if parsed.scheme in {"http", "https"}:
+            continue
+        if parsed.scheme != "gs":
+            raise ValueError("Meal photo URL must use https:// or gs://.")
+
+        bucket = parsed.netloc.strip()
+        object_path = parsed.path.lstrip("/")
+        if not bucket or not object_path:
+            raise ValueError("Meal photo gs:// URL is malformed.")
+        if not object_path.startswith(expected_prefix):
+            raise ValueError(
+                f"Meal photo must be uploaded under users/{firebase_uid}/feedings/..."
+            )
+
+
 def _parse_voice_transcript_fields(transcript: str | None) -> dict[str, Any]:
     if not transcript:
         return {}

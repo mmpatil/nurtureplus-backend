@@ -1164,6 +1164,13 @@ async def create_feeding(
 ) -> Feeding:
     baby_uuid = _parse_uuid(baby_id, "baby ID")
     await require_baby_edit_permission(db, baby_uuid, current_user)
+    try:
+        food_intelligence_crud.validate_feeding_media_urls(
+            feeding_create.media,
+            current_user.firebase_uid,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     feeding = await feeding_crud.create_feeding_entry(db, baby_uuid, current_user.id, feeding_create)
     if not feeding:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Baby not found")
@@ -1184,6 +1191,10 @@ async def analyze_feeding(
     baby_uuid = _parse_uuid(baby_id, "baby ID")
     await require_baby_edit_permission(db, baby_uuid, current_user)
     try:
+        food_intelligence_crud.validate_feeding_media_urls(
+            body.feeding.media,
+            current_user.firebase_uid,
+        )
         return await food_intelligence_crud.analyze_feeding(db, baby_uuid, current_user.id, body)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
@@ -1204,6 +1215,10 @@ async def confirm_feeding_analysis(
     baby_uuid = _parse_uuid(baby_id, "baby ID")
     await require_baby_edit_permission(db, baby_uuid, current_user)
     try:
+        food_intelligence_crud.validate_feeding_media_urls(
+            body.feeding.media,
+            current_user.firebase_uid,
+        )
         return await food_intelligence_crud.confirm_feeding_analysis(
             db,
             baby_uuid,
