@@ -194,6 +194,39 @@ async def _serialize_baby(
     )
 
 
+async def _serialize_babies(
+    db: AsyncSession,
+    items: list[dict],
+) -> list[Baby]:
+    """Batch-serialize multiple babies with two grouped queries instead of
+    two per-baby queries each (avoids N+1 round trips on the list endpoint)."""
+    baby_ids = [item["baby"].id for item in items]
+    caregiver_counts = await babies_crud.get_caregiver_counts(db, baby_ids)
+    owner_summaries = await babies_crud.get_owner_summaries(db, baby_ids)
+
+    result = []
+    for item in items:
+        baby = item["baby"]
+        role = item["role"]
+        owner_user = owner_summaries.get(baby.id)
+        result.append(
+            Baby(
+                id=baby.id,
+                user_id=baby.user_id,
+                name=baby.name,
+                birth_date=baby.birth_date,
+                photo_url=baby.photo_url,
+                created_at=baby.created_at,
+                updated_at=baby.updated_at,
+                current_user_role=role,
+                ownership_type="owned" if role == "owner" else "shared",
+                caregiver_count=caregiver_counts.get(baby.id, 0),
+                owner=_user_to_summary(owner_user) if owner_user else None,
+            )
+        )
+    return result
+
+
 async def _serialize_entry_with_audit(
     db: AsyncSession,
     entry,
@@ -764,11 +797,7 @@ async def list_babies(
         db, current_user.id, limit=limit, offset=offset
     )
 
-    items = []
-    for item in enriched_list:
-        baby = item["baby"]
-        role = item["role"]
-        items.append(await _serialize_baby(db, baby, role))
+    items = await _serialize_babies(db, enriched_list)
 
     return BabyListResponse(items=items, total=total, limit=limit, offset=offset)
 

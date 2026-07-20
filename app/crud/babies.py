@@ -75,17 +75,7 @@ async def get_babies_for_user(
     )
     rows = result.all()
 
-    enriched = []
-    for baby, access in rows:
-        caregiver_count = await _get_caregiver_count(db, baby.id)
-        owner_summary = await _get_owner_summary(db, baby.id)
-
-        enriched.append({
-            "baby": baby,
-            "role": access.role,
-            "caregiver_count": caregiver_count,
-            "owner": owner_summary,
-        })
+    enriched = [{"baby": baby, "role": access.role} for baby, access in rows]
 
     return enriched, total
 
@@ -114,6 +104,42 @@ async def _get_owner_summary(db: AsyncSession, baby_id: UUID) -> User | None:
         )
     )
     return result.scalar_one_or_none()
+
+
+async def get_caregiver_counts(
+    db: AsyncSession, baby_ids: list[UUID]
+) -> dict[UUID, int]:
+    """Batch caregiver counts (excluding owner) for multiple babies in one query."""
+    if not baby_ids:
+        return {}
+    result = await db.execute(
+        select(BabyAccess.baby_id, func.count(BabyAccess.id))
+        .where(
+            BabyAccess.baby_id.in_(baby_ids),
+            BabyAccess.role == "caregiver",
+            BabyAccess.status == "accepted",
+        )
+        .group_by(BabyAccess.baby_id)
+    )
+    return {baby_id: count for baby_id, count in result.all()}
+
+
+async def get_owner_summaries(
+    db: AsyncSession, baby_ids: list[UUID]
+) -> dict[UUID, User]:
+    """Batch owner User rows for multiple babies in one query."""
+    if not baby_ids:
+        return {}
+    result = await db.execute(
+        select(BabyAccess.baby_id, User)
+        .join(User, BabyAccess.user_id == User.id)
+        .where(
+            BabyAccess.baby_id.in_(baby_ids),
+            BabyAccess.role == "owner",
+            BabyAccess.status == "accepted",
+        )
+    )
+    return {baby_id: user for baby_id, user in result.all()}
 
 
 # ---------------------------------------------------------------------------
